@@ -2,7 +2,7 @@
 
 ## Objetivo
 
-FinancialEnv es un entorno de aprendizaje por refuerzo compatible con Gymnasium diseñado para el trading algorítmico. Su objetivo principal es proporcionar un entorno simplificado pero realista para entrenar y evaluar agentes de RL en tareas de toma de decisiones financieras.
+FinancialEnv es un entorno de aprendizaje por refuerzo compatible con Gymnasium diseñado para el trading algorítmico. Su objetivo principal es proporcionar un entorno simplificado y controlado para entrenar y evaluar agentes de RL en tareas de toma de decisiones financieras, adecuado para un MVP experimental.
 
 El entorno está diseñado específicamente para el TFM sobre aprendizaje por refuerzo financiero con representaciones latentes, sirviendo como base para experimentar con diferentes arquitecturas de agentes y estrategias de trading.
 
@@ -19,7 +19,8 @@ El espacio de acciones es `Discrete(3)`, con las siguientes acciones:
 El entorno implementa un modelo **long-only**, lo que significa:
 
 - **No se implementan posiciones short**: El entorno no permite vender en descubierto
-- **Sell cierra posición long**: La acción de sell solo cierra una posición larga existente
+- **Sell cierra posición long**: La acción de sell solo cierra una posición larga existente, no abre posiciones short
+- **position = -1 no se usa**: El valor -1 para position está reservado para futuras versiones que implementen short
 - **Sin apalancamiento**: No se permite operar con más capital del disponible
 - **Posición única**: Solo se puede mantener una posición a la vez (flat o long)
 
@@ -37,7 +38,7 @@ El entorno mantiene el siguiente estado interno:
   - `1 = long`: Posición larga abierta
   - `-1 = short`: No implementado en este MVP
 - **`position_units`**: Número de unidades del activo en posición larga
-- **`equity`**: Valor total de la cuenta (cash + valor de posición)
+- **`equity`**: Valor total de la cuenta, calculado como `equity = cash + position_units * current_price`
 - **`portfolio_value`**: Alias de equity (valor total del portafolio)
 
 ### Variables de Seguimiento
@@ -108,6 +109,21 @@ Cuando el agente ejecuta la acción de sell:
 - Cash final = $11,788.20 - $11.79 = $11,776.41
 - Realized profit = $11,776.41 - $10,000 = $1,776.41
 
+## Supuestos del MVP
+
+El entorno actual se basa en los siguientes supuestos simplificados:
+
+1. **Un único activo**: Solo se opera con un activo financiero a la vez
+2. **Long-only**: No se permiten posiciones short; position = -1 está reservado para futuras versiones
+3. **Inversión total del cash**: Al comprar, se invierte el 100% del cash disponible (limitación por no existir position sizing)
+4. **Ejecución al current_price**: Las órdenes se ejecutan al precio actual del activo, normalmente el precio de cierre
+5. **Costes proporcionales fijos**: Los costes de transacción son un porcentaje fijo del valor de la operación
+6. **Sin slippage ni spread**: No se modela el deslizamiento de precio ni el bid/ask spread
+7. **Reward basado en cambio de equity**: El reward se calcula como el cambio de equity normalizado por initial_balance
+8. **Evaluación basada en equity y total_return**: La evaluación principal se basa en final_equity y total_return
+
+Estos supuestos son intencionales para mantener el entorno controlado y adecuado para un MVP experimental.
+
 ## Cálculo de Reward
 
 El reward se calcula de forma consistente para todas las acciones:
@@ -125,6 +141,16 @@ reward = (new_equity - previous_equity) / initial_balance
    - Reward positivo → equity aumentó
    - Reward negativo → equity disminuyó
    - Reward cero → equity sin cambios
+
+### Nota sobre Reward Acumulado
+
+La suma de rewards a lo largo de un episodio aproxima el cambio acumulado de equity normalizado:
+
+```
+sum(rewards) ≈ (final_equity - initial_equity) / initial_balance
+```
+
+Por lo tanto, el reward acumulado debe interpretarse junto con `final_equity` y `total_return` para una evaluación completa del rendimiento.
 
 ### Ejemplo de Cálculo
 
@@ -175,7 +201,7 @@ El entorno actual tiene las siguientes limitaciones, intencionales para un MVP:
 
 ### Limitaciones de Datos
 
-10. **Datos OHLCV simplificados**: Se usan solo precios de cierre para decisiones
+10. **Valoración simplificada**: La observación contiene datos OHLCV, pero la valoración y ejecución se simplifican usando `current_price`, normalmente el precio de cierre
 11. **Sin microestructura**: No se considera bid/ask spread, depth, etc.
 12. **Sin eventos corporativos**: No se modelan dividendos, splits, etc.
 
@@ -183,7 +209,7 @@ El entorno actual tiene las siguientes limitaciones, intencionales para un MVP:
 
 13. **Sin restricciones de riesgo**: No hay límites de pérdida máxima
 14. **Sin gestión de capital**: No se implementa sizing dinámico
-15. **Sin horarios de mercado**: Se asume mercado continuo 24/7
+15. **Sin modelado de calendario de mercado**: No se modelan horarios de mercado, gaps intradía ni restricciones de sesión; se asume ejecución continua sin considerar horarios de apertura/cierre
 
 ## Mejoras Futuras Posibles
 
@@ -244,8 +270,8 @@ Las limitaciones intencionales permiten:
 
 El entorno actual incluye los elementos esenciales para RL financiero:
 
-- **Dinámica de precios**: Movimientos realistas del activo
-- **Costes de transacción**: Impacto realista de los trades
+- **Dinámica de precios**: Movimientos de precios basados en datos históricos
+- **Costes de transacción**: Impacto de los trades en el capital
 - **Gestión de posición**: Lógica de compra/venta/hold
 - **Reward coherente**: Alineado con objetivos financieros
 
