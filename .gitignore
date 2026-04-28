@@ -86,3 +86,8 @@ extract_pdf.py
 
 docs/tfm.pdf
 docs/tfm_extracted.txt
+
+models/
+*.pth
+*.pt
+*.ckpt
