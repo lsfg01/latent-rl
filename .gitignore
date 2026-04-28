@@ -81,3 +81,5 @@ logs/
 
 docs/tfm.pdf
 docs/tfm_extracted.txt
+
+extract_pdf.py
