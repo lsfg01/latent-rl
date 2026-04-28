@@ -78,3 +78,6 @@ logs/
 *.log
 # Claude Code local files
 .claude/
+
+docs/tfm.pdf
+docs/tfm_extracted.txt
