@@ -6,7 +6,8 @@ from latent_rl.data import CSVDataLoader, DataPreprocessor, YahooFinanceLoader
 from latent_rl.envs import FinancialEnv
 from latent_rl.representations import MLPLatentEncoder
 from latent_rl.evaluation import FinancialMetrics
-from latent_rl.agents import BaseAgent, RandomAgent, BuyAndHoldAgent, DQNAgent, ReplayBuffer
+from latent_rl.agents import BaseAgent, RandomAgent, BuyAndHoldAgent, DQNAgent, ReplayBuffer, LatentDQNAgent
+from latent_rl.pretraining import AutoencoderTrainer
 
 __all__ = [
     "CSVDataLoader",
@@ -20,4 +21,6 @@ __all__ = [
     "BuyAndHoldAgent",
     "DQNAgent",
     "ReplayBuffer",
+    "LatentDQNAgent",
+    "AutoencoderTrainer",
 ]
