@@ -133,17 +133,29 @@ def main():
     # desde lookback_window hasta lookback_window + n_samples
     close_prices = data["close"].values[lookback_window:lookback_window + n_samples]
 
+    # Calcular next_return (retorno siguiente)
+    next_returns = np.zeros_like(close_prices)
+    next_returns[:-1] = np.diff(close_prices) / close_prices[:-1]
+    # El último valor se queda como 0 (no hay siguiente retorno)
+
     results_df = pd.DataFrame({
         "sample": range(n_samples),
         "close": close_prices,
         "norm_index": indices["norm"],
         "first_component_index": indices["first_component"],
-        "pca_index": indices["pca"]
+        "pca_index": indices["pca"],
+        "next_return": next_returns
     })
 
-    results_path = results_dir / "latent_index_example.csv"
-    results_df.to_csv(results_path, index=False)
-    print(f"   - Resultados guardados en: {results_path}\n")
+    # Guardar con nombre original
+    results_path_example = results_dir / "latent_index_example.csv"
+    results_df.to_csv(results_path_example, index=False)
+    print(f"   - Resultados guardados en: {results_path_example}")
+
+    # Guardar con nombre esperado por el dashboard
+    results_path_dashboard = results_dir / "latent_index.csv"
+    results_df.to_csv(results_path_dashboard, index=False)
+    print(f"   - Resultados para dashboard guardados en: {results_path_dashboard}\n")
 
     print("=== Ejemplo completado ===")
     print("\nNotas:")
