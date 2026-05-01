@@ -5,12 +5,21 @@ Aplicación Dash interactiva para visualizar comparaciones de agentes
 y el Índice de Ventaja Latente (IVL).
 """
 
-import dash
-from dash import dcc, html, dash_table
-import pandas as pd
+import sys
+from pathlib import Path
 
-from data import load_all_dashboard_data
-from components import (
+import dash
+from dash import dcc, html, dash_table, Input, Output, State
+import pandas as pd
+import subprocess
+
+# Configurar PROJECT_ROOT y sys.path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Imports absolutos
+from dashboard.data import load_all_dashboard_data
+from dashboard.components import (
     create_kpi_card,
     create_ivl_card,
     create_delta_card,
@@ -52,6 +61,69 @@ def records_to_dataframe(records):
     if records is None:
         return None
     return pd.DataFrame(records)
+
+
+def run_dashboard_data_scripts():
+    """
+    Ejecuta los scripts de generación de datos del dashboard.
+
+    Returns:
+        tuple: (success: bool, log: str, error: str or None)
+    """
+    scripts = [
+        "examples/latent_index_example.py",
+        "examples/latent_advantage_example.py",
+        "examples/compare_agents_multiseed_experiment.py"
+    ]
+
+    log_lines = []
+    all_success = True
+
+    for script in scripts:
+        script_path = PROJECT_ROOT / script
+        log_lines.append(f"\n{'='*60}")
+        log_lines.append(f"Ejecutando: {script}")
+        log_lines.append(f"{'='*60}\n")
+
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                timeout=600  # 10 minutos por script
+            )
+
+            # Añadir stdout
+            if result.stdout:
+                log_lines.append(result.stdout)
+
+            # Añadir stderr si hay
+            if result.stderr:
+                log_lines.append(f"\n[STDERR]\n{result.stderr}")
+
+            # Verificar resultado
+            if result.returncode != 0:
+                all_success = False
+                log_lines.append(f"\n❌ Error: {script} falló con código {result.returncode}")
+                break
+            else:
+                log_lines.append(f"\n✅ Completado: {script}")
+
+        except subprocess.TimeoutExpired:
+            all_success = False
+            log_lines.append(f"\n❌ Error: {script} excedió el tiempo límite (10 minutos)")
+            break
+        except Exception as e:
+            all_success = False
+            log_lines.append(f"\n❌ Error inesperado al ejecutar {script}: {str(e)}")
+            break
+
+    # Truncar log a los últimos 4000 caracteres
+    full_log = "\n".join(log_lines)
+    truncated_log = full_log[-4000:] if len(full_log) > 4000 else full_log
+
+    return all_success, truncated_log, None if all_success else "Error en la ejecución de scripts"
 
 
 # Inicializar la aplicación Dash con carpeta assets
@@ -145,6 +217,45 @@ def create_layout():
                 className="subtitle"
             )
         ], className="header"),
+
+        # Control de Experimento
+        html.Div([
+            html.H2("Control de Experimento", className="section-title"),
+
+            html.Div([
+                html.P(
+                    "⚠️ La generación de datos puede tardar varios minutos. "
+                    "El botón se deshabilitará durante la ejecución.",
+                    className="control-warning"
+                ),
+
+                html.Div([
+                    html.Button(
+                        "▶ Generar datos del dashboard",
+                        id="generate-btn",
+                        n_clicks=0,
+                        className="control-button control-button-primary"
+                    ),
+                    html.Button(
+                        "🔄 Recargar datos",
+                        id="reload-btn",
+                        n_clicks=0,
+                        className="control-button control-button-secondary"
+                    )
+                ], className="control-buttons"),
+
+                html.Div(
+                    id="run-status-text",
+                    className="run-status",
+                    children="Listo",
+                    **{"data-status": "ready"}
+                ),
+
+                html.Div(id="run-result-message", className="run-result"),
+
+                html.Div(id="run-log", className="run-log")
+            ], className="control-content")
+        ], className="section control-section"),
 
         # Alerta de archivos faltantes
         create_missing_files_alert(),
@@ -275,6 +386,113 @@ def create_layout():
 
 # Crear layout
 app.layout = create_layout()
+
+
+# Callback para generar/recargar datos
+@app.callback(
+    Output('dashboard-data', 'data'),
+    Output('run-result-message', 'children'),
+    Output('run-log', 'children'),
+    Output('run-status-text', 'children'),
+    Output('run-status-text', 'data-status'),
+    Output('generate-btn', 'disabled'),
+    Input('generate-btn', 'n_clicks'),
+    Input('reload-btn', 'n_clicks'),
+    State('dashboard-data', 'data'),
+    prevent_initial_call=True
+)
+def update_dashboard_data(generate_clicks, reload_clicks, current_data):
+    """
+    Genera o recarga los datos del dashboard.
+
+    Args:
+        generate_clicks: Número de clicks en el botón de generar
+        reload_clicks: Número de clicks en el botón de recargar
+        current_data: Datos actuales del dashboard
+
+    Returns:
+        tuple: (dashboard_data, result_message, log, status_text, data_status, generate_disabled)
+    """
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        return current_data, html.Div(), html.Div(), "Listo", 'ready', False
+
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    # Caso 1: Generar datos (ejecutar scripts)
+    if button_id == 'generate-btn':
+        # Ejecutar scripts
+        success, log, error = run_dashboard_data_scripts()
+
+        if success:
+            # Recargar datos
+            try:
+                raw_data = load_all_dashboard_data()
+                new_data = {
+                    'agent_summary': dataframe_to_records(raw_data['agent_summary'][0]),
+                    'agent_seed_metrics': dataframe_to_records(raw_data['agent_seed_metrics'][0]),
+                    'ivl_results': dataframe_to_records(raw_data['ivl_results'][0]),
+                    'latent_index': dataframe_to_records(raw_data['latent_index'][0])
+                }
+
+                return (
+                    new_data,
+                    html.Div("✅ Datos generados y cargados correctamente", className="alert alert-success"),
+                    html.Div(log, className="run-log"),
+                    "Completado",
+                    'completed',
+                    False  # Habilitar botón
+                )
+            except Exception as e:
+                return (
+                    current_data,  # Mantener datos anteriores
+                    html.Div(f"⚠️ Scripts completados pero error al cargar datos: {str(e)}", className="alert alert-warning"),
+                    html.Div(log, className="run-log"),
+                    "Error al cargar datos",
+                    'error',
+                    False
+                )
+        else:
+            return (
+                current_data,  # Mantener datos anteriores
+                html.Div(f"❌ {error}", className="alert alert-danger"),
+                html.Div(log, className="run-log"),
+                "Error",
+                'error',
+                False
+            )
+
+    # Caso 2: Recargar datos (solo CSVs existentes)
+    elif button_id == 'reload-btn':
+        try:
+            raw_data = load_all_dashboard_data()
+            new_data = {
+                'agent_summary': dataframe_to_records(raw_data['agent_summary'][0]),
+                'agent_seed_metrics': dataframe_to_records(raw_data['agent_seed_metrics'][0]),
+                'ivl_results': dataframe_to_records(raw_data['ivl_results'][0]),
+                'latent_index': dataframe_to_records(raw_data['latent_index'][0])
+            }
+
+            return (
+                new_data,
+                html.Div("✅ Datos recargados correctamente", className="alert alert-success"),
+                html.Div("Datos recargados desde CSVs existentes", className="run-log"),
+                "Recargado",
+                'completed',
+                False
+            )
+        except Exception as e:
+            return (
+                current_data,
+                html.Div(f"❌ Error al recargar datos: {str(e)}", className="alert alert-danger"),
+                html.Div(str(e), className="run-log"),
+                "Error",
+                'error',
+                False
+            )
+
+    return current_data, html.Div(), html.Div(), "Listo", 'ready', False
 
 
 # Callbacks para actualizar gráficos y componentes

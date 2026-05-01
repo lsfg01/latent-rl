@@ -1,10 +1,10 @@
 """
-Ejemplo de uso del Índice de Ventaja Latente (IVL)
+Ejemplo de uso del Indice de Ventaja Latente (IVL)
 
-Este ejemplo demuestra cómo calcular el IVL comparando un agente
+Este ejemplo demuestra como calcular el IVL comparando un agente
 que utiliza representaciones latentes frente a un agente directo.
 
-El IVL es una métrica agregada que combina múltiples dimensiones de rendimiento:
+El IVL es una metrica agregada que combina multiples dimensiones de rendimiento:
 - Sharpe ratio
 - Maximum drawdown
 - Estabilidad entre semillas
@@ -18,9 +18,9 @@ from latent_rl.evaluation.latent_advantage import LatentAdvantageIndex
 
 
 def print_metrics(name: str, metrics: dict) -> None:
-    """Imprime métricas de forma formateada."""
+    """Imprime metricas de forma formateada."""
     print(f"\n{'='*60}")
-    print(f"Métricas {name}")
+    print(f"Metricas {name}")
     print(f"{'='*60}")
     print(f"Sharpe Ratio:          {metrics['sharpe']:.4f}")
     print(f"Max Drawdown:          {metrics['max_drawdown']:.4f}")
@@ -43,12 +43,12 @@ def print_deltas(result: dict) -> None:
 def print_ivl_result(result: dict) -> None:
     """Imprime el resultado del IVL."""
     print(f"\n{'='*60}")
-    print("Índice de Ventaja Latente (IVL)")
+    print("Indice de Ventaja Latente (IVL)")
     print(f"{'='*60}")
     print(f"IVL:                    {result['ivl']:+.6f}")
-    print(f"Interpretación:         {result['interpretation']}")
+    print(f"Interpretacion:         {result['interpretation']}")
 
-    # Interpretación en texto
+    # Interpretacion en texto
     interpretation_map = {
         "latent_advantage": "Ventaja Latente - El enfoque latente supera al directo",
         "direct_advantage": "Ventaja Directa - El enfoque directo supera al latente",
@@ -59,17 +59,17 @@ def print_ivl_result(result: dict) -> None:
 
 
 def main():
-    """Ejecuta el ejemplo de cálculo del IVL."""
+    """Ejecuta el ejemplo de calculo del IVL."""
 
     print("="*60)
-    print("Ejemplo del Índice de Ventaja Latente (IVL)")
+    print("Ejemplo del Indice de Ventaja Latente (IVL)")
     print("="*60)
 
     # Crear calculador de IVL con pesos por defecto
     ivl_calculator = LatentAdvantageIndex()
 
-    # Definir métricas sintéticas para un agente directo
-    # Este sería un agente que usa directamente los precios/returns
+    # Definir metricas sinteticas para un agente directo
+    # Este seria un agente que usa directamente los precios/returns
     direct_metrics = {
         "sharpe": 1.2,           # Sharpe ratio moderado
         "max_drawdown": 0.25,    # Drawdown del 25%
@@ -78,8 +78,8 @@ def main():
         "perf_oos": 0.10         # Rendimiento out-of-sample del 10% (gap grande)
     }
 
-    # Definir métricas sintéticas para un agente latente
-    # Este sería un agente que usa representaciones latentes
+    # Definir metricas sinteticas para un agente latente
+    # Este seria un agente que usa representaciones latentes
     latent_metrics = {
         "sharpe": 1.8,           # Mejor Sharpe ratio
         "max_drawdown": 0.15,    # Menor drawdown (15%)
@@ -88,7 +88,7 @@ def main():
         "perf_oos": 0.17         # Rendimiento out-of-sample del 17% (gap menor)
     }
 
-    # Imprimir métricas
+    # Imprimir metricas
     print_metrics("Agente Directo", direct_metrics)
     print_metrics("Agente Latente", latent_metrics)
 
@@ -139,7 +139,7 @@ def main():
 
     print(f"\nPesos personalizados: {custom_weights}")
     print(f"IVL con pesos personalizados: {result_custom['ivl']:+.6f}")
-    print(f"Interpretación: {result_custom['interpretation']}")
+    print(f"Interpretacion: {result_custom['interpretation']}")
 
     # Ejemplo donde el agente directo es mejor
     print(f"\n{'='*60}")
@@ -167,36 +167,36 @@ def main():
 
     # Notas importantes
     print(f"\n{'='*60}")
-    print("⚠️ Notas Importantes")
+    print("Notas Importantes")
     print(f"{'='*60}")
     print("""
-1. El IVL NO sustituye a las métricas individuales:
+1. El IVL NO sustituye a las metricas individuales:
    - Debe analizarse cada componente por separado
    - El IVL es una medida agregada de apoyo
 
 2. El IVL sirve como medida agregada de apoyo:
-   - Proporciona una visión holística del rendimiento
+   - Proporciona una vision holistica del rendimiento
    - Facilita comparaciones entre diferentes enfoques
 
-3. Debe calcularse sobre comparaciones homogéneas:
-   - Mismos períodos de tiempo
-   - Mismos condiciones de mercado
-   - Mismos hiperparámetros (excepto la representación)
+3. Debe calcularse sobre comparaciones homogeneas:
+   - Mismos periodos de tiempo
+   - Mismas condiciones de mercado
+   - Mismos hiperparametros (excepto la representacion)
 
-4. La validación formal requiere:
+4. La validacion formal requiere:
    - Datos reales de mercado
-   - Múltiples semillas aleatorias
+   - Multiples semillas aleatorias
    - Splits temporales In-Sample / Out-of-Sample apropiados
-   - Validación cruzada temporal
+   - Validacion cruzada temporal
 
-5. Interpretación del IVL:
+5. Interpretacion del IVL:
    - IVL > 0: Ventaja del enfoque latente
-   - IVL ≈ 0: No hay diferencia significativa
+   - IVL ~= 0: No hay diferencia significativa
    - IVL < 0: Ventaja del enfoque directo
 
 6. Limitaciones:
-   - Los pesos pueden ajustarse según el caso de uso
-   - La correlación no implica causalidad
+   - Los pesos pueden ajustarse segun el caso de uso
+   - La correlacion no implica causalidad
    - Resultados pasados no garantizan resultados futuros
     """)
 
