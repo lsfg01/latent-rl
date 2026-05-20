@@ -1,8 +1,11 @@
 """
 Dashboard de Ventaja Latente
 
-Aplicación Dash interactiva para visualizar comparaciones de agentes
-y el Índice de Ventaja Latente (IVL).
+Aplicacion Dash interactiva para visualizar comparaciones de agentes RL
+y el Indice de Ventaja Latente (IVL).
+
+La logica de datos y calculos no se modifica en este fichero.
+Solo se define el layout y los callbacks de actualizacion.
 """
 
 import sys
@@ -13,15 +16,17 @@ from dash import dcc, html, dash_table, Input, Output, State
 import pandas as pd
 import subprocess
 
-# Configurar PROJECT_ROOT y sys.path
+# ---------------------------------------------------------------------------
+# Rutas
+# ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Imports absolutos
 from dashboard.data import load_all_dashboard_data
 from dashboard.components import (
     create_kpi_card,
     create_ivl_card,
+    create_ivl_kpi_card,
     create_delta_card,
     create_agent_return_bar,
     create_seed_return_boxplot,
@@ -29,43 +34,91 @@ from dashboard.components import (
     create_ivl_delta_bar,
     create_price_vs_latent_plot,
     create_latent_indices_plot,
-    create_pca_vs_next_return_scatter
+    create_pca_vs_next_return_scatter,
 )
 
+# ---------------------------------------------------------------------------
+# Constantes de estilo (complementan el CSS — solo para casos puntuales)
+# ---------------------------------------------------------------------------
+COLORS = {
+    "bg":       "#f4f6fb",
+    "card":     "#ffffff",
+    "accent":   "#3b6fd4",
+    "text":     "#1a202c",
+    "muted":    "#718096",
+    "border":   "#e2e8f0",
+    "positive": "#276749",
+    "negative": "#c53030",
+}
+
+TABLE_HEADER_STYLE = {
+    "backgroundColor": "#ebf0fb",
+    "color": COLORS["text"],
+    "fontWeight": "700",
+    "fontSize": "12px",
+    "textAlign": "center",
+    "borderBottom": f"2px solid {COLORS['accent']}",
+    "padding": "10px 8px",
+}
+
+TABLE_CELL_STYLE = {
+    "textAlign": "center",
+    "fontSize": "12px",
+    "padding": "8px",
+    "color": COLORS["text"],
+    "borderBottom": f"1px solid {COLORS['border']}",
+}
+
+TABLE_CELL_COND = [
+    {"if": {"row_index": "odd"}, "backgroundColor": "#f7fafc"},
+    {"if": {"row_index": "even"}, "backgroundColor": COLORS["card"]},
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers de serialización
+# ---------------------------------------------------------------------------
 
 def dataframe_to_records(df):
-    """
-    Convierte un DataFrame a records JSON serializables.
-
-    Args:
-        df: DataFrame a convertir
-
-    Returns:
-        Lista de diccionarios o None si df es None
-    """
     if df is None:
         return None
     return df.copy().to_dict("records")
 
 
 def records_to_dataframe(records):
-    """
-    Reconstruye un DataFrame desde records JSON serializables.
-
-    Args:
-        records: Lista de diccionarios o None
-
-    Returns:
-        DataFrame o None si records es None
-    """
     if records is None:
         return None
     return pd.DataFrame(records)
 
 
+def get_first_existing_column(df: pd.DataFrame, candidates: list, required: bool = True):
+    """
+    Devuelve el primer nombre de columna de candidates que exista en df.
+
+    Compatible con el formato antiguo (mean_return) y el nuevo IS/OOS
+    (mean_return_oos, mean_return_is, ...).
+
+    Raises:
+        KeyError: Si required=True y ninguna columna de candidates existe.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    if required:
+        raise KeyError(
+            f"No se encontro ninguna de estas columnas: {candidates}. "
+            f"Columnas disponibles: {df.columns.tolist()}"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Ejecucion de scripts de generacion de datos
+# ---------------------------------------------------------------------------
+
 def run_dashboard_data_scripts():
     """
-    Ejecuta los scripts de generación de datos del dashboard.
+    Ejecuta los scripts de generacion de datos del dashboard en orden.
 
     Returns:
         tuple: (success: bool, log: str, error: str or None)
@@ -81,9 +134,9 @@ def run_dashboard_data_scripts():
 
     for script in scripts:
         script_path = PROJECT_ROOT / script
-        log_lines.append(f"\n{'='*60}")
+        log_lines.append(f"\n{'='*50}")
         log_lines.append(f"Ejecutando: {script}")
-        log_lines.append(f"{'='*60}\n")
+        log_lines.append(f"{'='*50}\n")
 
         try:
             result = subprocess.run(
@@ -91,555 +144,515 @@ def run_dashboard_data_scripts():
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
-                timeout=600  # 10 minutos por script
+                timeout=600,
             )
 
-            # Añadir stdout
             if result.stdout:
                 log_lines.append(result.stdout)
-
-            # Añadir stderr si hay
             if result.stderr:
                 log_lines.append(f"\n[STDERR]\n{result.stderr}")
 
-            # Verificar resultado
             if result.returncode != 0:
                 all_success = False
-                log_lines.append(f"\n❌ Error: {script} falló con código {result.returncode}")
+                log_lines.append(f"\nError: {script} fallo con codigo {result.returncode}")
                 break
             else:
-                log_lines.append(f"\n✅ Completado: {script}")
+                log_lines.append(f"\nCompletado: {script}")
 
         except subprocess.TimeoutExpired:
             all_success = False
-            log_lines.append(f"\n❌ Error: {script} excedió el tiempo límite (10 minutos)")
+            log_lines.append(f"\nError: {script} excedio el tiempo limite (10 min)")
             break
-        except Exception as e:
+        except Exception as exc:
             all_success = False
-            log_lines.append(f"\n❌ Error inesperado al ejecutar {script}: {str(e)}")
+            log_lines.append(f"\nError inesperado al ejecutar {script}: {exc}")
             break
 
-    # Truncar log a los últimos 4000 caracteres
     full_log = "\n".join(log_lines)
     truncated_log = full_log[-4000:] if len(full_log) > 4000 else full_log
+    return all_success, truncated_log, None if all_success else "Error en la ejecucion de scripts"
 
-    return all_success, truncated_log, None if all_success else "Error en la ejecución de scripts"
+
+# ---------------------------------------------------------------------------
+# Carga inicial de datos
+# ---------------------------------------------------------------------------
+print("Cargando datos del dashboard...")
+raw_dashboard_data = load_all_dashboard_data()
+
+agent_summary_df,      agent_summary_error      = raw_dashboard_data["agent_summary"]
+agent_seed_metrics_df, agent_seed_metrics_error  = raw_dashboard_data["agent_seed_metrics"]
+ivl_results_df,        ivl_results_error         = raw_dashboard_data["ivl_results"]
+latent_index_df,       latent_index_error         = raw_dashboard_data["latent_index"]
+
+dashboard_data_serializable = {
+    "agent_summary":      dataframe_to_records(agent_summary_df),
+    "agent_seed_metrics": dataframe_to_records(agent_seed_metrics_df),
+    "ivl_results":        dataframe_to_records(ivl_results_df),
+    "latent_index":       dataframe_to_records(latent_index_df),
+}
+
+missing_files = {k: v for k, v in {
+    "agent_summary.csv":      agent_summary_error,
+    "agent_seed_metrics.csv": agent_seed_metrics_error,
+    "ivl_results.csv":        ivl_results_error,
+    "latent_index.csv":       latent_index_error,
+}.items() if v}
+
+# ---------------------------------------------------------------------------
+# Deteccion de columnas — compatible con formato antiguo y nuevo IS/OOS
+# ---------------------------------------------------------------------------
+if agent_summary_df is not None and not agent_summary_df.empty:
+    AGENT_COL = get_first_existing_column(
+        agent_summary_df, ["agent_name", "agent", "Agent"])
+    RETURN_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_return_oos", "mean_return", "mean_return_is",
+         "return_mean", "total_return_mean", "mean_total_return"])
+    STD_RETURN_COL = get_first_existing_column(
+        agent_summary_df,
+        ["std_return_oos", "seed_std_return_oos", "std_return", "seed_std_return",
+         "std_return_is", "seed_std_return_is"],
+        required=False)
+    TRADES_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_n_trades", "mean_trades", "n_trades_mean", "trades_mean"],
+        required=False)
+    EQUITY_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_final_equity_oos", "mean_final_equity", "final_equity_mean",
+         "mean_equity_oos", "mean_equity"],
+        required=False)
+else:
+    AGENT_COL     = "agent_name"
+    RETURN_COL    = "mean_return"
+    STD_RETURN_COL = None
+    TRADES_COL     = None
+    EQUITY_COL     = None
+
+# ---------------------------------------------------------------------------
+# KPIs iniciales
+# ---------------------------------------------------------------------------
+kpi_data = {}
+if agent_summary_df is not None and not agent_summary_df.empty:
+    kpi_data["num_agents"]  = len(agent_summary_df)
+    kpi_data["best_agent"]  = agent_summary_df.loc[
+        agent_summary_df[RETURN_COL].idxmax(), AGENT_COL]
+    kpi_data["best_return"] = agent_summary_df[RETURN_COL].max()
+else:
+    kpi_data["num_agents"]  = 0
+    kpi_data["best_agent"]  = "N/A"
+    kpi_data["best_return"] = 0.0
+
+if agent_seed_metrics_df is not None and not agent_seed_metrics_df.empty:
+    kpi_data["num_seeds"] = agent_seed_metrics_df["seed"].nunique()
+else:
+    kpi_data["num_seeds"] = 0
+
+if ivl_results_df is not None and not ivl_results_df.empty:
+    kpi_data["ivl_value"]          = ivl_results_df.iloc[0]["ivl"]
+    kpi_data["ivl_interpretation"] = ivl_results_df.iloc[0]["interpretation"]
+else:
+    kpi_data["ivl_value"]          = 0.0
+    kpi_data["ivl_interpretation"] = "N/A"
 
 
-# Inicializar la aplicación Dash con carpeta assets
+# ---------------------------------------------------------------------------
+# Componentes de layout
+# ---------------------------------------------------------------------------
+
+def _missing_files_alert():
+    """Banda de avisos de archivos faltantes, solo si hay alguno."""
+    if not missing_files:
+        return html.Div()
+    alerts = [
+        html.Div([
+            html.Span(f"Archivo faltante: {fname}", className="alert-title"),
+            html.Span(f"  {msg}", className="alert-message"),
+        ], className="alert alert-warning")
+        for fname, msg in missing_files.items()
+    ]
+    return html.Div(alerts, style={"marginBottom": "8px"})
+
+
+def _control_panel():
+    """Panel de control compacto en una sola fila."""
+    return html.Div([
+        html.Div("Control de Experimento", className="section-title"),
+        html.Div([
+            html.P(
+                "Los scripts pueden tardar varios minutos. "
+                "El experimento descarga datos de Yahoo Finance y entrena agentes.",
+                className="control-warning",
+            ),
+            html.Div([
+                html.Button(
+                    "Generar datos",
+                    id="generate-btn",
+                    n_clicks=0,
+                    className="control-button control-button-primary",
+                ),
+                html.Button(
+                    "Recargar CSV",
+                    id="reload-btn",
+                    n_clicks=0,
+                    className="control-button control-button-secondary",
+                ),
+                html.Span(
+                    "Listo",
+                    id="run-status-text",
+                    className="run-status",
+                    **{"data-status": "ready"},
+                ),
+            ], className="control-buttons"),
+            html.Div(id="run-result-message", className="run-result"),
+            html.Div(id="run-log", className="run-log"),
+        ], className="control-content"),
+    ], className="section control-section")
+
+
+def _kpi_row():
+    """Fila de 4 tarjetas KPI."""
+    return html.Div([
+        create_kpi_card("Agentes comparados", str(kpi_data["num_agents"])),
+        create_kpi_card("Semillas", str(kpi_data["num_seeds"])),
+        create_kpi_card(
+            "Mejor agente (OOS)" if RETURN_COL and "oos" in RETURN_COL else "Mejor agente",
+            kpi_data["best_agent"],
+            f"Retorno: {kpi_data['best_return']:+.4f}",
+        ),
+        create_ivl_kpi_card(kpi_data["ivl_value"], kpi_data["ivl_interpretation"]),
+    ], className="kpi-grid", style={"marginBottom": "16px"})
+
+
+def _section(title, *children, class_extra=""):
+    return html.Div([
+        html.Div(title, className="section-title"),
+        *children,
+    ], className=f"section {class_extra}".strip())
+
+
+# ---------------------------------------------------------------------------
+# Layout principal
+# ---------------------------------------------------------------------------
+
+def create_layout():
+    return html.Div([
+        dcc.Store(id="dashboard-data", data=dashboard_data_serializable),
+
+        # ── Header ──────────────────────────────────────────────────────────
+        html.Div([
+            html.H1("Dashboard de Ventaja Latente", className="header-title"),
+            html.Div(
+                "Comparacion exploratoria de agentes financieros con y sin representaciones latentes",
+                className="subtitle",
+            ),
+        ], className="header"),
+
+        # ── Contenido principal ─────────────────────────────────────────────
+        html.Div([
+
+            # Control + alertas
+            _control_panel(),
+            _missing_files_alert(),
+
+            # KPIs
+            _kpi_row(),
+
+            # ── Seccion IVL ─────────────────────────────────────────────────
+            _section("Indice de Ventaja Latente (IVL)",
+
+                # Valor + badge (layout horizontal)
+                html.Div([
+                    html.Div([
+                        create_ivl_card(
+                            kpi_data["ivl_value"],
+                            kpi_data["ivl_interpretation"],
+                        ),
+                    ], style={"minWidth": "180px"}),
+
+                    html.Div([
+                        html.Div("Componentes", className="section-title",
+                                 style={"fontSize": "0.85em", "marginBottom": "10px"}),
+                        html.Div(id="ivl-delta-cards"),
+                    ], style={"flex": "1"}),
+                ], className="ivl-card"),
+
+                # Grafica de deltas
+                html.Div(id="ivl-delta-chart", className="graph-container"),
+            ),
+
+            # ── Comparacion de agentes ───────────────────────────────────────
+            _section("Comparacion de Agentes",
+                html.Div([
+                    html.Div(id="agent-comparison-chart", className="graph-container"),
+                    html.Div(id="agent-summary-table",    className="table-container"),
+                ], className="chart-grid"),
+            ),
+
+            # ── Metricas por semilla ─────────────────────────────────────────
+            _section("Metricas por Semilla",
+                html.Div([
+                    html.Div(id="seed-boxplot-chart", className="graph-container"),
+                    html.Div(id="seed-scatter-chart", className="graph-container"),
+                ], className="chart-grid"),
+            ),
+
+            # ── Espacio latente (auxiliar) ───────────────────────────────────
+            _section("Espacio Latente (Analisis Auxiliar)",
+                html.P(
+                    "Analisis auxiliar del espacio latente. "
+                    "No corresponde al IVL principal del TFM.",
+                    className="auxiliary-note",
+                ),
+                html.Div([
+                    html.Div(id="price-vs-latent-chart",  className="graph-container"),
+                    html.Div(id="latent-indices-chart",   className="graph-container"),
+                    html.Div(id="pca-vs-return-chart",    className="graph-container"),
+                ], className="chart-grid-3"),
+            ),
+
+            # ── Notas metodologicas ──────────────────────────────────────────
+            _section("Notas Metodologicas",
+                html.Div([
+                    html.H3("Limitaciones del experimento"),
+                    html.Ul([
+                        html.Li("Dashboard exploratorio — no prueba superioridad estadistica."),
+                        html.Li("Entrenamiento corto (10 episodios) con datos reales de Yahoo Finance."),
+                        html.Li("El IVL es una metrica agregada; analizar cada componente por separado."),
+                        html.Li("El split IS/OOS es temporal: IS precede siempre a OOS."),
+                        html.Li("Resultados pasados no garantizan resultados futuros."),
+                    ]),
+                ], className="notes"),
+            ),
+
+            # ── Footer ──────────────────────────────────────────────────────
+            html.Div(
+                "Dashboard de Ventaja Latente — TFM sobre RL con representaciones latentes",
+                className="footer",
+            ),
+
+        ], className="dashboard-container"),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# App Dash
+# ---------------------------------------------------------------------------
 app = dash.Dash(
     __name__,
     title="Dashboard de Ventaja Latente",
     suppress_callback_exceptions=True,
-    assets_folder="assets"
+    assets_folder="assets",
 )
 
-# Cargar datos
-print("Cargando datos del dashboard...")
-raw_dashboard_data = load_all_dashboard_data()
-
-# Extraer DataFrames y errores
-agent_summary_df, agent_summary_error = raw_dashboard_data['agent_summary']
-agent_seed_metrics_df, agent_seed_metrics_error = raw_dashboard_data['agent_seed_metrics']
-ivl_results_df, ivl_results_error = raw_dashboard_data['ivl_results']
-latent_index_df, latent_index_error = raw_dashboard_data['latent_index']
-
-# Convertir DataFrames a records JSON serializables para dcc.Store
-dashboard_data_serializable = {
-    'agent_summary': dataframe_to_records(agent_summary_df),
-    'agent_seed_metrics': dataframe_to_records(agent_seed_metrics_df),
-    'ivl_results': dataframe_to_records(ivl_results_df),
-    'latent_index': dataframe_to_records(latent_index_df)
-}
-
-# Verificar archivos faltantes
-missing_files = {
-    'agent_summary.csv': agent_summary_error,
-    'agent_seed_metrics.csv': agent_seed_metrics_error,
-    'ivl_results.csv': ivl_results_error,
-    'latent_index.csv': latent_index_error
-}
-
-# Filtrar solo archivos faltantes
-missing_files = {k: v for k, v in missing_files.items() if v}
-
-# Calcular KPIs si hay datos
-kpi_data = {}
-if agent_summary_df is not None and not agent_summary_df.empty:
-    kpi_data['num_agents'] = len(agent_summary_df)
-    kpi_data['best_agent'] = agent_summary_df.loc[agent_summary_df['mean_return'].idxmax(), 'agent_name']
-    kpi_data['best_return'] = agent_summary_df['mean_return'].max()
-else:
-    kpi_data['num_agents'] = 0
-    kpi_data['best_agent'] = 'N/A'
-    kpi_data['best_return'] = 0.0
-
-if agent_seed_metrics_df is not None and not agent_seed_metrics_df.empty:
-    kpi_data['num_seeds'] = agent_seed_metrics_df['seed'].nunique()
-else:
-    kpi_data['num_seeds'] = 0
-
-if ivl_results_df is not None and not ivl_results_df.empty:
-    kpi_data['ivl_value'] = ivl_results_df.iloc[0]['ivl']
-    kpi_data['ivl_interpretation'] = ivl_results_df.iloc[0]['interpretation']
-else:
-    kpi_data['ivl_value'] = 0.0
-    kpi_data['ivl_interpretation'] = 'N/A'
-
-
-def create_missing_files_alert():
-    """Crea una alerta con los archivos faltantes."""
-    if not missing_files:
-        return html.Div()
-
-    alerts = []
-    for filename, error_msg in missing_files.items():
-        alerts.append(
-            html.Div([
-                html.Div(f"⚠️ {filename}", className="alert-title"),
-                html.Div(error_msg, className="alert-message")
-            ], className="alert alert-warning")
-        )
-
-    return html.Div(alerts)
-
-
-def create_layout():
-    """Crea el layout del dashboard."""
-    return html.Div([
-        dcc.Store(id='dashboard-data', data=dashboard_data_serializable),
-
-        # Header
-        html.Div([
-            html.H1("Dashboard de Ventaja Latente", className="header-title"),
-            html.Div(
-                "Comparación exploratoria de agentes financieros con y sin representaciones latentes",
-                className="subtitle"
-            )
-        ], className="header"),
-
-        # Control de Experimento
-        html.Div([
-            html.H2("Control de Experimento", className="section-title"),
-
-            html.Div([
-                html.P(
-                    "⚠️ La generación de datos puede tardar varios minutos. "
-                    "El botón se deshabilitará durante la ejecución.",
-                    className="control-warning"
-                ),
-
-                html.Div([
-                    html.Button(
-                        "▶ Generar datos del dashboard",
-                        id="generate-btn",
-                        n_clicks=0,
-                        className="control-button control-button-primary"
-                    ),
-                    html.Button(
-                        "🔄 Recargar datos",
-                        id="reload-btn",
-                        n_clicks=0,
-                        className="control-button control-button-secondary"
-                    )
-                ], className="control-buttons"),
-
-                html.Div(
-                    id="run-status-text",
-                    className="run-status",
-                    children="Listo",
-                    **{"data-status": "ready"}
-                ),
-
-                html.Div(id="run-result-message", className="run-result"),
-
-                html.Div(id="run-log", className="run-log")
-            ], className="control-content")
-        ], className="section control-section"),
-
-        # Alerta de archivos faltantes
-        create_missing_files_alert(),
-
-        # Contenedor principal
-        html.Div([
-
-            # KPI Cards
-            html.Div([
-                html.H2("Resumen", className="section-title"),
-                html.Div([
-                    create_kpi_card(
-                        "Número de Agentes",
-                        str(kpi_data['num_agents'])
-                    ),
-                    create_kpi_card(
-                        "Número de Semillas",
-                        str(kpi_data['num_seeds'])
-                    ),
-                    create_kpi_card(
-                        "Mejor Agente",
-                        kpi_data['best_agent'],
-                        f"Retorno: {kpi_data['best_return']:.4f}"
-                    ),
-                    create_kpi_card(
-                        "IVL Principal",
-                        f"{kpi_data['ivl_value']:+.4f}",
-                        kpi_data['ivl_interpretation'].replace('_', ' ').title()
-                    )
-                ], className="kpi-grid")
-            ], className="section"),
-
-            # IVL Section
-            html.Div([
-                html.H2("Índice de Ventaja Latente (IVL)", className="section-title"),
-
-                # IVL Card grande
-                create_ivl_card(
-                    kpi_data['ivl_value'],
-                    kpi_data['ivl_interpretation']
-                ),
-
-                # Delta cards
-                html.Div([
-                    html.H3("Componentes del IVL", style={'margin-bottom': '15px'}),
-                    html.Div(id="ivl-delta-cards")
-                ], className="delta-grid"),
-
-                # Gráfico de deltas
-                html.Div(id="ivl-delta-chart", className="graph-container"),
-
-                # Interpretación
-                html.Div([
-                    html.H3("Interpretación", style={'margin-bottom': '10px'}),
-                    html.P(
-                        "El IVL indica ventaja agregada bajo las métricas y pesos definidos; "
-                        "no prueba superioridad general.",
-                        style={'color': '#666', 'font-style': 'italic'}
-                    )
-                ], style={'margin-top': '20px'})
-
-            ], className="section"),
-
-            # Comparación de Agentes
-            html.Div([
-                html.H2("Comparación de Agentes", className="section-title"),
-
-                html.Div(id="agent-comparison-chart", className="graph-container"),
-
-                html.Div(id="agent-summary-table", className="table-container")
-
-            ], className="section"),
-
-            # Métricas por Semilla
-            html.Div([
-                html.H2("Métricas por Semilla", className="section-title"),
-
-                html.Div(id="seed-boxplot-chart", className="graph-container"),
-
-                html.Div(id="seed-scatter-chart", className="graph-container")
-
-            ], className="section"),
-
-            # Espacio Latente Auxiliar
-            html.Div([
-                html.H2("Espacio Latente (Análisis Auxiliar)", className="section-title"),
-
-                html.Div([
-                    html.P(
-                        "⚠️ Análisis auxiliar del espacio latente; no corresponde al IVL principal.",
-                        className="auxiliary-note"
-                    )
-                ]),
-
-                html.Div(id="price-vs-latent-chart", className="graph-container"),
-
-                html.Div(id="latent-indices-chart", className="graph-container"),
-
-                html.Div(id="pca-vs-return-chart", className="graph-container")
-
-            ], className="section"),
-
-            # Notas Metodológicas
-            html.Div([
-                html.H2("Notas Metodológicas", className="section-title"),
-                html.Div([
-                    html.H3("⚠️ Importante"),
-                    html.Ul([
-                        html.Li("Este dashboard es exploratorio y no prueba superioridad estadística."),
-                        html.Li("Los resultados requieren validación con datos reales de mercado."),
-                        html.Li("Es necesario implementar splits temporales In-Sample / Out-of-Sample apropiados."),
-                        html.Li("Se requieren métricas financieras adicionales para una evaluación completa."),
-                        html.Li("El IVL es una métrica agregada que no sustituye el análisis individual de cada componente."),
-                        html.Li("La correlación observada no implica causalidad."),
-                        html.Li("Resultados pasados no garantizan resultados futuros.")
-                    ])
-                ], className="notes")
-            ], className="section"),
-
-            # Footer
-            html.Div([
-                html.P("Dashboard de Ventaja Latente - Generado automáticamente")
-            ], className="footer")
-
-        ], className="dashboard-container")
-    ])
-
-
-# Crear layout
 app.layout = create_layout()
 
 
-# Callback para generar/recargar datos
+# ---------------------------------------------------------------------------
+# Callbacks
+# ---------------------------------------------------------------------------
+
 @app.callback(
-    Output('dashboard-data', 'data'),
-    Output('run-result-message', 'children'),
-    Output('run-log', 'children'),
-    Output('run-status-text', 'children'),
-    Output('run-status-text', 'data-status'),
-    Output('generate-btn', 'disabled'),
-    Input('generate-btn', 'n_clicks'),
-    Input('reload-btn', 'n_clicks'),
-    State('dashboard-data', 'data'),
-    prevent_initial_call=True
+    Output("dashboard-data",    "data"),
+    Output("run-result-message","children"),
+    Output("run-log",           "children"),
+    Output("run-status-text",   "children"),
+    Output("run-status-text",   "data-status"),
+    Output("generate-btn",      "disabled"),
+    Input("generate-btn",       "n_clicks"),
+    Input("reload-btn",         "n_clicks"),
+    State("dashboard-data",     "data"),
+    prevent_initial_call=True,
 )
 def update_dashboard_data(generate_clicks, reload_clicks, current_data):
-    """
-    Genera o recarga los datos del dashboard.
-
-    Args:
-        generate_clicks: Número de clicks en el botón de generar
-        reload_clicks: Número de clicks en el botón de recargar
-        current_data: Datos actuales del dashboard
-
-    Returns:
-        tuple: (dashboard_data, result_message, log, status_text, data_status, generate_disabled)
-    """
     ctx = dash.callback_context
-
     if not ctx.triggered:
-        return current_data, html.Div(), html.Div(), "Listo", 'ready', False
+        return current_data, html.Div(), html.Div(), "Listo", "ready", False
 
-    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
-    # Caso 1: Generar datos (ejecutar scripts)
-    if button_id == 'generate-btn':
-        # Ejecutar scripts
+    if button_id == "generate-btn":
         success, log, error = run_dashboard_data_scripts()
-
         if success:
-            # Recargar datos
             try:
-                raw_data = load_all_dashboard_data()
+                raw = load_all_dashboard_data()
                 new_data = {
-                    'agent_summary': dataframe_to_records(raw_data['agent_summary'][0]),
-                    'agent_seed_metrics': dataframe_to_records(raw_data['agent_seed_metrics'][0]),
-                    'ivl_results': dataframe_to_records(raw_data['ivl_results'][0]),
-                    'latent_index': dataframe_to_records(raw_data['latent_index'][0])
+                    "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
+                    "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
+                    "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
+                    "latent_index":       dataframe_to_records(raw["latent_index"][0]),
                 }
-
-                return (
-                    new_data,
-                    html.Div("✅ Datos generados y cargados correctamente", className="alert alert-success"),
-                    html.Div(log, className="run-log"),
-                    "Completado",
-                    'completed',
-                    False  # Habilitar botón
-                )
-            except Exception as e:
-                return (
-                    current_data,  # Mantener datos anteriores
-                    html.Div(f"⚠️ Scripts completados pero error al cargar datos: {str(e)}", className="alert alert-warning"),
-                    html.Div(log, className="run-log"),
-                    "Error al cargar datos",
-                    'error',
-                    False
-                )
+                return (new_data,
+                        html.Div("Datos generados y cargados correctamente",
+                                 className="alert alert-success"),
+                        html.Div(log, className="run-log"),
+                        "Completado", "completed", False)
+            except Exception as exc:
+                return (current_data,
+                        html.Div(f"Scripts completados, pero error al cargar datos: {exc}",
+                                 className="alert alert-warning"),
+                        html.Div(log, className="run-log"),
+                        "Error al cargar", "error", False)
         else:
-            return (
-                current_data,  # Mantener datos anteriores
-                html.Div(f"❌ {error}", className="alert alert-danger"),
-                html.Div(log, className="run-log"),
-                "Error",
-                'error',
-                False
-            )
+            return (current_data,
+                    html.Div(f"Error: {error}", className="alert alert-danger"),
+                    html.Div(log, className="run-log"),
+                    "Error", "error", False)
 
-    # Caso 2: Recargar datos (solo CSVs existentes)
-    elif button_id == 'reload-btn':
+    elif button_id == "reload-btn":
         try:
-            raw_data = load_all_dashboard_data()
+            raw = load_all_dashboard_data()
             new_data = {
-                'agent_summary': dataframe_to_records(raw_data['agent_summary'][0]),
-                'agent_seed_metrics': dataframe_to_records(raw_data['agent_seed_metrics'][0]),
-                'ivl_results': dataframe_to_records(raw_data['ivl_results'][0]),
-                'latent_index': dataframe_to_records(raw_data['latent_index'][0])
+                "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
+                "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
+                "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
+                "latent_index":       dataframe_to_records(raw["latent_index"][0]),
             }
+            return (new_data,
+                    html.Div("Datos recargados desde los CSV existentes",
+                             className="alert alert-success"),
+                    html.Div("", className="run-log"),
+                    "Recargado", "completed", False)
+        except Exception as exc:
+            return (current_data,
+                    html.Div(f"Error al recargar: {exc}", className="alert alert-danger"),
+                    html.Div(str(exc), className="run-log"),
+                    "Error", "error", False)
 
-            return (
-                new_data,
-                html.Div("✅ Datos recargados correctamente", className="alert alert-success"),
-                html.Div("Datos recargados desde CSVs existentes", className="run-log"),
-                "Recargado",
-                'completed',
-                False
-            )
-        except Exception as e:
-            return (
-                current_data,
-                html.Div(f"❌ Error al recargar datos: {str(e)}", className="alert alert-danger"),
-                html.Div(str(e), className="run-log"),
-                "Error",
-                'error',
-                False
-            )
-
-    return current_data, html.Div(), html.Div(), "Listo", 'ready', False
+    return current_data, html.Div(), html.Div(), "Listo", "ready", False
 
 
-# Callbacks para actualizar gráficos y componentes
 @app.callback(
-    dash.dependencies.Output('ivl-delta-cards', 'children'),
-    dash.dependencies.Output('ivl-delta-chart', 'children'),
-    dash.dependencies.Input('dashboard-data', 'data')
+    Output("ivl-delta-cards", "children"),
+    Output("ivl-delta-chart",  "children"),
+    Input("dashboard-data",    "data"),
 )
 def update_ivl_section(data):
-    """Actualiza la sección del IVL."""
     try:
-        ivl_records = data.get('ivl_results')
-        ivl_df = records_to_dataframe(ivl_records)
-
+        ivl_df = records_to_dataframe(data.get("ivl_results"))
         if ivl_df is None or ivl_df.empty:
-            return html.Div("No hay datos de IVL disponibles"), html.Div("No hay datos disponibles")
+            empty = html.Div("No hay datos de IVL disponibles",
+                             style={"color": "#718096", "fontSize": "0.9em"})
+            return empty, empty
 
         row = ivl_df.iloc[0]
-
-        # Crear delta cards
         delta_cards = html.Div([
-            create_delta_card("Delta Sharpe", row['delta_sharpe'], is_better_positive=True),
-            create_delta_card("Delta MDD", row['delta_mdd'], is_better_positive=False),
-            create_delta_card("Delta Seed Std", row['delta_seed_std'], is_better_positive=False),
-            create_delta_card("Delta IS/OOS Gap", row['delta_is_oos_gap'], is_better_positive=False)
+            create_delta_card("Delta Sharpe",    row["delta_sharpe"],    is_better_positive=True),
+            create_delta_card("Delta MDD",       row["delta_mdd"],       is_better_positive=False),
+            create_delta_card("Delta Seed Std",  row["delta_seed_std"],  is_better_positive=False),
+            create_delta_card("Delta IS/OOS Gap",row["delta_is_oos_gap"],is_better_positive=False),
         ], className="delta-grid")
 
-        # Crear gráfico de deltas
-        delta_chart = dcc.Graph(figure=create_ivl_delta_bar(ivl_df))
-
+        delta_chart = dcc.Graph(
+            figure=create_ivl_delta_bar(ivl_df),
+            config={"displayModeBar": False},
+        )
         return delta_cards, delta_chart
-    except Exception as e:
-        return html.Div(f"Error al cargar IVL: {str(e)}"), html.Div("Error al cargar datos")
+    except Exception as exc:
+        err = html.Div(f"Error IVL: {exc}", style={"color": "#c53030"})
+        return err, err
 
 
 @app.callback(
-    dash.dependencies.Output('agent-comparison-chart', 'children'),
-    dash.dependencies.Output('agent-summary-table', 'children'),
-    dash.dependencies.Input('dashboard-data', 'data')
+    Output("agent-comparison-chart", "children"),
+    Output("agent-summary-table",    "children"),
+    Input("dashboard-data",          "data"),
 )
 def update_agent_comparison(data):
-    """Actualiza la comparación de agentes."""
     try:
-        summary_records = data.get('agent_summary')
+        summary_records = data.get("agent_summary")
         summary_df = records_to_dataframe(summary_records)
 
         if summary_df is None or summary_df.empty:
-            return html.Div("No hay datos de agentes disponibles"), html.Div("No hay datos disponibles")
+            msg = html.Div("No hay datos de agentes disponibles",
+                           style={"color": "#718096"})
+            return msg, msg
 
-        # Crear gráfico
-        chart = dcc.Graph(figure=create_agent_return_bar(summary_df))
-
-        # Crear tabla
-        table = dash_table.DataTable(
-            data=summary_records if summary_records else [],
-            columns=[{"name": i, "id": i} for i in summary_df.columns] if summary_df is not None else [],
-            style_table={'overflowX': 'auto'},
-            style_header={
-                'backgroundColor': 'rgb(102, 126, 234)',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            style_cell={
-                'textAlign': 'center',
-                'padding': '10px'
-            },
-            style_data_conditional=[
-                {
-                    'if': {'row_index': 'odd'},
-                    'backgroundColor': 'rgb(248, 248, 248)'
-                }
-            ]
+        chart = dcc.Graph(
+            figure=create_agent_return_bar(summary_df),
+            config={"displayModeBar": False},
         )
 
+        # Columnas legibles: excluir columnas muy largas
+        display_cols = [c for c in summary_df.columns if c not in ("seed",)]
+        table = dash_table.DataTable(
+            data=summary_records or [],
+            columns=[{"name": c, "id": c} for c in display_cols],
+            style_table={"overflowX": "auto", "fontSize": "12px"},
+            style_header=TABLE_HEADER_STYLE,
+            style_cell=TABLE_CELL_STYLE,
+            style_data_conditional=TABLE_CELL_COND,
+            page_size=10,
+        )
         return chart, table
-    except Exception as e:
-        return html.Div(f"Error al cargar comparación: {str(e)}"), html.Div("Error al cargar datos")
+    except Exception as exc:
+        err = html.Div(f"Error comparacion: {exc}", style={"color": "#c53030"})
+        return err, err
 
 
 @app.callback(
-    dash.dependencies.Output('seed-boxplot-chart', 'children'),
-    dash.dependencies.Output('seed-scatter-chart', 'children'),
-    dash.dependencies.Input('dashboard-data', 'data')
+    Output("seed-boxplot-chart", "children"),
+    Output("seed-scatter-chart", "children"),
+    Input("dashboard-data",      "data"),
 )
 def update_seed_metrics(data):
-    """Actualiza las métricas por semilla."""
     try:
-        seed_records = data.get('agent_seed_metrics')
-        seed_df = records_to_dataframe(seed_records)
-
+        seed_df = records_to_dataframe(data.get("agent_seed_metrics"))
         if seed_df is None or seed_df.empty:
-            return html.Div("No hay datos por semilla disponibles"), html.Div("No hay datos disponibles")
+            msg = html.Div("No hay datos por semilla disponibles",
+                           style={"color": "#718096"})
+            return msg, msg
 
-        # Crear gráficos
-        boxplot = dcc.Graph(figure=create_seed_return_boxplot(seed_df))
-        scatter = dcc.Graph(figure=create_seed_return_scatter(seed_df))
-
+        boxplot = dcc.Graph(figure=create_seed_return_boxplot(seed_df),
+                            config={"displayModeBar": False})
+        scatter = dcc.Graph(figure=create_seed_return_scatter(seed_df),
+                            config={"displayModeBar": False})
         return boxplot, scatter
-    except Exception as e:
-        return html.Div(f"Error al cargar métricas por semilla: {str(e)}"), html.Div("Error al cargar datos")
+    except Exception as exc:
+        err = html.Div(f"Error metricas por semilla: {exc}", style={"color": "#c53030"})
+        return err, err
 
 
 @app.callback(
-    dash.dependencies.Output('price-vs-latent-chart', 'children'),
-    dash.dependencies.Output('latent-indices-chart', 'children'),
-    dash.dependencies.Output('pca-vs-return-chart', 'children'),
-    dash.dependencies.Input('dashboard-data', 'data')
+    Output("price-vs-latent-chart", "children"),
+    Output("latent-indices-chart",  "children"),
+    Output("pca-vs-return-chart",   "children"),
+    Input("dashboard-data",         "data"),
 )
 def update_latent_space(data):
-    """Actualiza la sección del espacio latente."""
     try:
-        latent_records = data.get('latent_index')
-        latent_df = records_to_dataframe(latent_records)
-
+        latent_df = records_to_dataframe(data.get("latent_index"))
         if latent_df is None or latent_df.empty:
-            return (
-                html.Div("No hay datos de índice latente disponibles"),
-                html.Div("No hay datos disponibles"),
-                html.Div("No hay datos disponibles")
-            )
+            msg = html.Div("No hay datos de indice latente disponibles",
+                           style={"color": "#718096"})
+            return msg, msg, msg
 
-        # Crear gráficos
-        price_chart = dcc.Graph(figure=create_price_vs_latent_plot(latent_df))
-        indices_chart = dcc.Graph(figure=create_latent_indices_plot(latent_df))
-        pca_chart = dcc.Graph(figure=create_pca_vs_next_return_scatter(latent_df))
-
+        price_chart   = dcc.Graph(figure=create_price_vs_latent_plot(latent_df),
+                                  config={"displayModeBar": False})
+        indices_chart = dcc.Graph(figure=create_latent_indices_plot(latent_df),
+                                  config={"displayModeBar": False})
+        pca_chart     = dcc.Graph(figure=create_pca_vs_next_return_scatter(latent_df),
+                                  config={"displayModeBar": False})
         return price_chart, indices_chart, pca_chart
-    except Exception as e:
-        return (
-            html.Div(f"Error al cargar espacio latente: {str(e)}"),
-            html.Div("Error al cargar datos"),
-            html.Div("Error al cargar datos")
-        )
+    except Exception as exc:
+        err = html.Div(f"Error espacio latente: {exc}", style={"color": "#c53030"})
+        return err, err, err
 
 
-if __name__ == '__main__':
-    print("\n" + "="*60)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
     print("Dashboard de Ventaja Latente")
-    print("="*60)
-    print(f"\nAbriendo dashboard en: http://127.0.0.1:8050")
-    print("\nPresiona Ctrl+C para detener el servidor\n")
+    print("=" * 60)
+    print("\nhttp://127.0.0.1:8050")
+    print("Ctrl+C para detener\n")
 
     if missing_files:
-        print("⚠️ Archivos faltantes:")
-        for filename, error in missing_files.items():
-            print(f"  - {filename}")
-            print(f"    {error}")
+        print("Archivos faltantes:")
+        for fname, err in missing_files.items():
+            print(f"  - {fname}")
         print()
 
-    app.run(debug=True, host='127.0.0.1', port=8050)
+    app.run(debug=True, host="127.0.0.1", port=8050)

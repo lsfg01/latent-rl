@@ -1,6 +1,6 @@
 """Módulo de componentes del dashboard."""
 
-from .cards import create_kpi_card, create_ivl_card, create_delta_card
+from .cards import create_kpi_card, create_ivl_card, create_ivl_kpi_card, create_delta_card
 from .figures import (
     create_agent_return_bar,
     create_seed_return_boxplot,
@@ -14,6 +14,7 @@ from .figures import (
 __all__ = [
     "create_kpi_card",
     "create_ivl_card",
+    "create_ivl_kpi_card",
     "create_delta_card",
     "create_agent_return_bar",
     "create_seed_return_boxplot",
