@@ -9,6 +9,11 @@ El IVL es una metrica agregada que combina multiples dimensiones de rendimiento:
 - Maximum drawdown
 - Estabilidad entre semillas
 - Gap entre rendimiento in-sample y out-of-sample
+
+AVISO: Las metricas de este script son sinteticas y estan hardcodeadas con fines
+pedagogicos. No reflejan resultados reales de ningun agente entrenado.
+Para calcular el IVL a partir de un experimento real, usa compute_ivl_from_results.py
+despues de ejecutar compare_agents_multiseed_experiment.py.
 """
 
 import pandas as pd

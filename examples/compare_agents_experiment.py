@@ -88,10 +88,10 @@ def evaluate_agent(agent: Any, env: FinancialEnv, name: str, n_episodes: int = 5
         steps = 0
 
         # Configurar agente para evaluación determinista
-        if hasattr(agent, 'set_epsilon'):
-            agent.set_epsilon(0.0)
         if hasattr(agent, 'reset'):
             agent.reset()
+        if hasattr(agent, 'set_epsilon'):
+            agent.set_epsilon(0.0)
 
         while not done:
             # Seleccionar acción

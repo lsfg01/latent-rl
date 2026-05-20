@@ -314,6 +314,121 @@ class TestFinancialEnv:
 
         env.close()
 
+    def test_realized_profit_single_trade(self):
+        """Un ciclo buy→sell produce realized_profit correcto."""
+        np.random.seed(0)
+        prices = np.full(20, 100.0)
+        prices[10:] = 110.0  # sube a 110 en el paso 10
+        data = pd.DataFrame({
+            "Open": prices, "High": prices + 1, "Low": prices - 1,
+            "Close": prices, "Volume": np.ones(20) * 1000
+        })
+        env = FinancialEnv(data, initial_balance=10000.0, transaction_cost=0.0, lookback_window=2)
+        env.reset()
+
+        # Buy en paso 2 (precio 100)
+        env.step(1)
+        assert env._cash_at_last_buy == pytest.approx(10000.0)
+
+        # Hold hasta que el precio sube
+        for _ in range(8):
+            env.step(0)
+
+        # Sell en precio 110
+        env.step(2)
+
+        expected_profit = env.position_units_before_sell if hasattr(env, 'position_units_before_sell') else None
+        # profit = units * 110 - cash_invested = (10000/100)*110 - 10000 = 11000 - 10000 = 1000
+        assert env.realized_profit == pytest.approx(1000.0, rel=1e-4)
+        assert env._cash_at_last_buy == pytest.approx(0.0)
+
+    def test_realized_profit_two_trades_accumulates(self):
+        """Dos ciclos buy→sell acumulan realized_profit correctamente."""
+        prices = np.array([100.0] * 5 + [110.0] * 5 + [110.0] * 5 + [120.0] * 5)
+        data = pd.DataFrame({
+            "Open": prices, "High": prices + 1, "Low": prices - 1,
+            "Close": prices, "Volume": np.ones(20) * 1000
+        })
+        env = FinancialEnv(data, initial_balance=10000.0, transaction_cost=0.0, lookback_window=2)
+        env.reset()
+
+        # Trade 1: buy a 100, sell a 110
+        env.step(1)   # buy
+        for _ in range(3):
+            env.step(0)   # hold
+        env.step(2)   # sell a 110
+        profit_after_trade1 = env.realized_profit
+        assert profit_after_trade1 > 0
+
+        # Trade 2: buy a 110, sell a 120
+        env.step(1)   # buy
+        cash_invested_trade2 = env._cash_at_last_buy
+        for _ in range(3):
+            env.step(0)   # hold
+        env.step(2)   # sell a 120
+        profit_after_trade2 = env.realized_profit
+
+        # realized_profit debe ser la suma de ambos trades
+        expected_trade2_profit = env.cash - cash_invested_trade2
+        assert profit_after_trade2 == pytest.approx(profit_after_trade1 + expected_trade2_profit, rel=1e-4)
+
+    def test_realized_profit_losing_trade(self):
+        """Un trade perdedor produce realized_profit negativo."""
+        prices = np.array([100.0] * 5 + [80.0] * 5 + [80.0] * 10)
+        data = pd.DataFrame({
+            "Open": prices, "High": prices + 1, "Low": prices - 1,
+            "Close": prices, "Volume": np.ones(20) * 1000
+        })
+        env = FinancialEnv(data, initial_balance=10000.0, transaction_cost=0.0, lookback_window=2)
+        env.reset()
+
+        env.step(1)   # buy a 100
+        for _ in range(3):
+            env.step(0)
+        env.step(2)   # sell a 80
+
+        # profit = 10000*(80/100) - 10000 = -2000
+        assert env.realized_profit == pytest.approx(-2000.0, rel=1e-4)
+
+    def test_realized_profit_resets_on_env_reset(self):
+        """env.reset() reinicia realized_profit y _cash_at_last_buy a 0."""
+        data = pd.DataFrame({
+            "Open": [100.0] * 10, "High": [101.0] * 10, "Low": [99.0] * 10,
+            "Close": [100.0] * 10, "Volume": [1000.0] * 10
+        })
+        env = FinancialEnv(data, initial_balance=10000.0, transaction_cost=0.0, lookback_window=2)
+        env.reset()
+
+        env.step(1)   # buy
+        env.step(2)   # sell
+        assert env.realized_profit != 0 or env.position == 0
+
+        env.reset()
+        assert env.realized_profit == pytest.approx(0.0)
+        assert env._cash_at_last_buy == pytest.approx(0.0)
+
+    def test_realized_profit_zero_when_position_never_closed(self):
+        """Si el agente compra y nunca vende, realized_profit es 0 al final del episodio."""
+        prices = np.linspace(100, 120, 20)
+        data = pd.DataFrame({
+            "Open": prices, "High": prices + 1, "Low": prices - 1,
+            "Close": prices, "Volume": np.ones(20) * 1000
+        })
+        env = FinancialEnv(data, initial_balance=10000.0, transaction_cost=0.0, lookback_window=2)
+        env.reset()
+
+        # Buy y luego solo hold hasta el final
+        env.step(1)
+        done = False
+        info = {}
+        while not done:
+            _, _, terminated, truncated, info = env.step(0)
+            done = terminated or truncated
+
+        # Posición abierta → realized_profit = 0, pero equity > initial_balance
+        assert info["realized_profit"] == pytest.approx(0.0)
+        assert info["equity"] > env.initial_balance
+
 
 class TestBaseFinancialEnv:
     """Tests para BaseFinancialEnv."""

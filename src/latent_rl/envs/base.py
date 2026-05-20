@@ -3,6 +3,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+from typing import Optional
 
 
 class BaseFinancialEnv(gym.Env):
