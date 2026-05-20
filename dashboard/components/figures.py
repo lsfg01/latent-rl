@@ -1,8 +1,8 @@
 """
-Generación de gráficos Plotly para el dashboard.
+Generacion de graficos Plotly para el dashboard.
 
-Este módulo proporciona funciones para crear todos los gráficos
-interactivos del dashboard usando Plotly.
+Todos los graficos usan el template 'plotly_white' y margenes compactos
+para encajar en el diseno academico del dashboard.
 """
 
 import plotly.graph_objects as go
@@ -11,184 +11,169 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Tuple
 
+# Paleta coherente con el CSS
+ACCENT      = "#3b6fd4"
+POSITIVE    = "#276749"
+NEGATIVE    = "#c53030"
+NEUTRAL     = "#718096"
+TEMPLATE    = "plotly_white"
+MARGIN      = dict(l=40, r=20, t=48, b=36)
+TITLE_FONT  = dict(size=13, color="#1a202c")
+AXIS_FONT   = dict(size=11, color="#718096")
 
-def create_empty_figure(message: str = "No hay datos disponibles") -> go.Figure:
-    """
-    Crea una figura vacía con un mensaje centrado.
+AGENT_COLORS = [
+    "#3b6fd4", "#276749", "#c53030", "#b7791f", "#553c9a",
+]
 
-    Args:
-        message: Mensaje a mostrar en la figura
 
-    Returns:
-        Figura Plotly vacía con anotación
-    """
-    fig = go.Figure()
-    fig.add_annotation(
-        text=message,
-        xref="paper", yref="paper",
-        x=0.5, y=0.5, showarrow=False,
-        font=dict(size=14, color="gray")
-    )
-    fig.update_layout(
-        xaxis=dict(showgrid=False, showticklabels=False),
-        yaxis=dict(showgrid=False, showticklabels=False),
-        margin=dict(l=0, r=0, t=0, b=0)
-    )
-    return fig
-
+# ── helpers internos ──────────────────────────────────────────────────────────
 
 def _first_existing_col(df: pd.DataFrame, candidates: list, required: bool = True):
     """
     Devuelve el primer nombre de candidatos que exista en df.columns.
 
-    Versión local de get_first_existing_column usada internamente por las
-    funciones de figura para tolerar distintos formatos de CSV.
+    Compatible con el formato antiguo (mean_return) y el nuevo IS/OOS
+    (mean_return_oos, mean_return_is).
     """
     for col in candidates:
         if col in df.columns:
             return col
     if required:
         raise KeyError(
-            f"No se encontró ninguna de estas columnas: {candidates}. "
+            f"No se encontro ninguna de estas columnas: {candidates}. "
             f"Columnas disponibles: {df.columns.tolist()}"
         )
     return None
-
-
-def validate_dataframe(df: pd.DataFrame, required_columns: list) -> Tuple[bool, str]:
-    """
-    Valida que un DataFrame tenga las columnas requeridas.
-
-    Args:
-        df: DataFrame a validar
-        required_columns: Lista de columnas requeridas
-
-    Returns:
-        Tuple con (es_valido, mensaje_error)
-    """
-    if df is None:
-        return False, "DataFrame es None"
-
-    if df.empty:
-        return False, "DataFrame está vacío"
-
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        return False, f"Faltan columnas: {missing_columns}"
-
-    return True, ""
-
-
-def create_agent_return_bar(
-    df: pd.DataFrame,
-    title: str = "Retorno Medio por Agente"
-) -> go.Figure:
-    """
-    Crea un gráfico de barras con el retorno medio por agente.
-
-    Compatible con el formato antiguo (mean_return) y el nuevo IS/OOS
-    (mean_return_oos, mean_return_is). Prioriza OOS si está disponible.
-
-    Args:
-        df: DataFrame de agent_summary con columnas agent y return
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el gráfico de barras
-    """
-    if df is None or df.empty:
-        return create_empty_figure("No hay datos de agentes disponibles")
-
-    # Detectar columnas — priorizar OOS
-    try:
-        agent_col = _first_existing_col(df, ["agent_name", "agent", "Agent"])
-        return_col = _first_existing_col(df, [
-            "mean_return_oos", "mean_return", "mean_return_is",
-            "return_mean", "total_return_mean", "mean_total_return",
-        ])
-    except KeyError as exc:
-        return create_empty_figure(f"Columnas no encontradas: {exc}")
-
-    std_col = _first_existing_col(df, [
-        "std_return_oos", "seed_std_return_oos", "std_return", "seed_std_return",
-        "std_return_is", "seed_std_return_is",
-    ], required=False)
-
-    # Etiqueta del eje X según la columna elegida
-    x_label = "Retorno OOS" if "oos" in return_col else "Retorno Medio"
-    if title == "Retorno Medio por Agente" and "oos" in return_col:
-        title = "Retorno Medio por Agente (OOS)"
-
-    fig = go.Figure()
-
-    for _, row in df.iterrows():
-        error_x = None
-        if std_col is not None:
-            error_x = dict(type='data', array=[row[std_col]], visible=True)
-
-        fig.add_trace(go.Bar(
-            name=row[agent_col],
-            x=[row[return_col]],
-            y=[row[agent_col]],
-            orientation='h',
-            error_x=error_x,
-            text=[f"{row[return_col]:.4f}"],
-            textposition='outside'
-        ))
-
-    fig.update_layout(
-        title=title,
-        xaxis_title=x_label,
-        yaxis_title="Agente",
-        barmode='group',
-        height=400,
-        margin=dict(l=150, r=50, t=50, b=50)
-    )
-
-    return fig
-
-
-def _filter_split(df: pd.DataFrame, preferred: str = "oos") -> tuple:
-    """
-    Si el DataFrame tiene una columna 'split', filtra a las filas con el valor
-    preferido (por defecto 'oos'). Si no existe esa columna o el filtro devuelve
-    vacío, devuelve el DataFrame original y una etiqueta vacía.
-
-    Returns:
-        (df_filtered, label_suffix)  donde label_suffix indica el split activo.
-    """
-    if "split" not in df.columns:
-        return df, ""
-    filtered = df[df["split"] == preferred]
-    if filtered.empty:
-        return df, ""
-    return filtered, f" ({preferred.upper()})"
 
 
 def _detect_agent_col(df: pd.DataFrame) -> str:
     return _first_existing_col(df, ["agent_name", "agent", "Agent"])
 
 
-def create_seed_return_boxplot(
-    df: pd.DataFrame,
-    title: str = "Distribución de Retornos por Semilla"
-) -> go.Figure:
+def _filter_split(df: pd.DataFrame, preferred: str = "oos") -> tuple:
     """
-    Crea un boxplot de retornos por semilla para cada agente.
-
-    Compatible con el formato nuevo que incluye columna 'split' (IS/OOS).
-    Cuando existe, filtra a OOS para mostrar la distribución de generalización.
-
-    Args:
-        df: DataFrame de agent_seed_metrics con columnas agent_name, seed, total_return
-        title: Título del gráfico
+    Filtra a las filas del split preferido cuando existe la columna 'split'.
+    Si no existe o el filtro queda vacio, devuelve el DataFrame original.
 
     Returns:
-        Figura Plotly con el boxplot
+        (df_filtered, label_suffix)
     """
-    is_valid, error_msg = validate_dataframe(df, ['seed', 'total_return'])
+    if "split" not in df.columns:
+        return df, ""
+    filtered = df[df["split"] == preferred]
+    if filtered.empty:
+        return df, ""
+    return filtered, f" (OOS)"
+
+
+def _base_layout(fig: go.Figure, title: str, **kwargs) -> go.Figure:
+    """Aplica configuracion base a cualquier figura."""
+    fig.update_layout(
+        template=TEMPLATE,
+        title=dict(text=title, font=TITLE_FONT, x=0, xanchor="left", pad=dict(l=4)),
+        margin=MARGIN,
+        font=AXIS_FONT,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        **kwargs,
+    )
+    return fig
+
+
+def create_empty_figure(message: str = "No hay datos disponibles") -> go.Figure:
+    """Figura vacia con mensaje centrado."""
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message,
+        xref="paper", yref="paper",
+        x=0.5, y=0.5, showarrow=False,
+        font=dict(size=13, color="#718096"),
+    )
+    fig.update_layout(
+        template=TEMPLATE,
+        margin=MARGIN,
+        xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+        yaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+    )
+    return fig
+
+
+def validate_dataframe(df: pd.DataFrame, required_columns: list) -> Tuple[bool, str]:
+    if df is None:
+        return False, "DataFrame es None"
+    if df.empty:
+        return False, "DataFrame esta vacio"
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        return False, f"Faltan columnas: {missing}"
+    return True, ""
+
+
+# ── figuras principales ───────────────────────────────────────────────────────
+
+def create_agent_return_bar(df: pd.DataFrame) -> go.Figure:
+    """
+    Barras horizontales del retorno medio por agente.
+
+    Detecta automaticamente las columnas disponibles y prioriza OOS.
+    Compatible con el formato antiguo (mean_return) y el nuevo IS/OOS.
+    """
+    if df is None or df.empty:
+        return create_empty_figure("No hay datos de agentes disponibles")
+
+    try:
+        agent_col  = _first_existing_col(df, ["agent_name", "agent", "Agent"])
+        return_col = _first_existing_col(df, [
+            "mean_return_oos", "mean_return", "mean_return_is",
+            "return_mean", "total_return_mean", "mean_total_return",
+        ])
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+
+    std_col = _first_existing_col(df, [
+        "std_return_oos", "seed_std_return_oos", "std_return", "seed_std_return",
+        "std_return_is", "seed_std_return_is",
+    ], required=False)
+
+    x_label = "Retorno OOS" if "oos" in return_col else "Retorno Medio"
+    title   = "Retorno por Agente (OOS)" if "oos" in return_col else "Retorno Medio por Agente"
+
+    agents  = df[agent_col].tolist()
+    values  = df[return_col].tolist()
+    colors  = [POSITIVE if v >= 0 else NEGATIVE for v in values]
+
+    error_x = None
+    if std_col:
+        error_x = dict(type="data", array=df[std_col].tolist(), visible=True,
+                       color="#a0aec0", thickness=1.5, width=4)
+
+    fig = go.Figure(go.Bar(
+        y=agents,
+        x=values,
+        orientation="h",
+        marker_color=colors,
+        error_x=error_x,
+        text=[f"{v:+.3f}" for v in values],
+        textposition="outside",
+        textfont=dict(size=11),
+    ))
+
+    fig.add_vline(x=0, line_color="#cbd5e0", line_width=1)
+    _base_layout(fig, title, xaxis_title=x_label, yaxis_title="",
+                 height=320, bargap=0.3,
+                 yaxis=dict(autorange="reversed"))
+    return fig
+
+
+def create_seed_return_boxplot(df: pd.DataFrame) -> go.Figure:
+    """
+    Boxplot de retornos por semilla para cada agente.
+
+    Filtra a OOS cuando existe la columna 'split'.
+    """
+    is_valid, error_msg = validate_dataframe(df, ["seed", "total_return"])
     if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+        return create_empty_figure(f"Sin datos: {error_msg}")
 
     try:
         agent_col = _detect_agent_col(df)
@@ -196,49 +181,37 @@ def create_seed_return_boxplot(
         return create_empty_figure(str(exc))
 
     df_plot, split_label = _filter_split(df)
-    fig = go.Figure()
+    agents = df_plot[agent_col].unique()
 
-    for agent in df_plot[agent_col].unique():
-        agent_data = df_plot[df_plot[agent_col] == agent]['total_return']
+    fig = go.Figure()
+    for i, agent in enumerate(agents):
+        data = df_plot[df_plot[agent_col] == agent]["total_return"]
         fig.add_trace(go.Box(
-            y=agent_data,
+            y=data,
             name=agent,
-            boxpoints='all',
-            jitter=0.3,
-            pointpos=-1.8
+            boxpoints="all",
+            jitter=0.4,
+            pointpos=-1.6,
+            marker=dict(size=5, color=AGENT_COLORS[i % len(AGENT_COLORS)]),
+            line=dict(color=AGENT_COLORS[i % len(AGENT_COLORS)]),
         ))
 
-    fig.update_layout(
-        title=title + split_label,
-        yaxis_title="Retorno Total",
-        xaxis_title="Agente",
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50)
-    )
-
+    _base_layout(fig, f"Distribucion de Retornos por Semilla{split_label}",
+                 yaxis_title="Retorno Total", xaxis_title="",
+                 height=320, showlegend=False)
+    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e0", line_width=1)
     return fig
 
 
-def create_seed_return_scatter(
-    df: pd.DataFrame,
-    title: str = "Retorno Total por Semilla"
-) -> go.Figure:
+def create_seed_return_scatter(df: pd.DataFrame) -> go.Figure:
     """
-    Crea un scatter plot de retornos por semilla.
+    Scatter de retorno por semilla para cada agente.
 
-    Compatible con el formato nuevo que incluye columna 'split' (IS/OOS).
-    Cuando existe, filtra a OOS para mostrar la evolución entre semillas.
-
-    Args:
-        df: DataFrame de agent_seed_metrics con columnas agent_name, seed, total_return
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el scatter plot
+    Filtra a OOS cuando existe la columna 'split'.
     """
-    is_valid, error_msg = validate_dataframe(df, ['seed', 'total_return'])
+    is_valid, error_msg = validate_dataframe(df, ["seed", "total_return"])
     if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+        return create_empty_figure(f"Sin datos: {error_msg}")
 
     try:
         agent_col = _detect_agent_col(df)
@@ -248,272 +221,147 @@ def create_seed_return_scatter(
     df_plot, split_label = _filter_split(df)
     fig = go.Figure()
 
-    for agent in df_plot[agent_col].unique():
-        agent_data = df_plot[df_plot[agent_col] == agent]
+    for i, agent in enumerate(df_plot[agent_col].unique()):
+        d = df_plot[df_plot[agent_col] == agent]
         fig.add_trace(go.Scatter(
-            x=agent_data['seed'],
-            y=agent_data['total_return'],
-            mode='markers+lines',
+            x=d["seed"],
+            y=d["total_return"],
+            mode="markers+lines",
             name=agent,
-            marker=dict(size=8),
-            line=dict(width=1)
+            marker=dict(size=7, color=AGENT_COLORS[i % len(AGENT_COLORS)]),
+            line=dict(width=1.5, color=AGENT_COLORS[i % len(AGENT_COLORS)]),
         ))
 
-    fig.update_layout(
-        title=title + split_label,
-        xaxis_title="Semilla",
-        yaxis_title="Retorno Total",
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50),
-        hovermode='x unified'
-    )
-
+    _base_layout(fig, f"Retorno por Semilla{split_label}",
+                 xaxis_title="Semilla", yaxis_title="Retorno Total",
+                 height=320, hovermode="x unified",
+                 legend=dict(font=dict(size=10), orientation="h",
+                             y=-0.22, x=0, xanchor="left"))
+    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e0", line_width=1)
     return fig
 
 
-def create_ivl_delta_bar(
-    df: pd.DataFrame,
-    title: str = "Componentes del IVL"
-) -> go.Figure:
-    """
-    Crea un gráfico de barras con los componentes del IVL.
-
-    Args:
-        df: DataFrame con columnas delta_sharpe, delta_mdd, delta_seed_std, delta_is_oos_gap
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el gráfico de barras
-    """
-    is_valid, error_msg = validate_dataframe(df, ['delta_sharpe', 'delta_mdd', 'delta_seed_std', 'delta_is_oos_gap'])
+def create_ivl_delta_bar(df: pd.DataFrame) -> go.Figure:
+    """Barras de los componentes del IVL (delta Sharpe, MDD, Seed Std, IS/OOS Gap)."""
+    is_valid, error_msg = validate_dataframe(
+        df, ["delta_sharpe", "delta_mdd", "delta_seed_std", "delta_is_oos_gap"])
     if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+        return create_empty_figure(f"Sin datos IVL: {error_msg}")
 
-    # Usar la primera fila (asumimos una comparación)
     row = df.iloc[0]
+    labels = ["d Sharpe", "d MDD", "d Seed Std", "d IS/OOS Gap"]
+    values = [
+        row["delta_sharpe"],
+        row["delta_mdd"],
+        row["delta_seed_std"],
+        row["delta_is_oos_gap"],
+    ]
+    # verde si el delta es favorable para la representacion latente
+    better_positive = [True, False, False, False]
+    colors = [
+        POSITIVE if (bp and v > 0) or (not bp and v < 0) else NEGATIVE
+        for v, bp in zip(values, better_positive)
+    ]
 
-    deltas = {
-        'Delta Sharpe': row['delta_sharpe'],
-        'Delta MDD': row['delta_mdd'],
-        'Delta Seed Std': row['delta_seed_std'],
-        'Delta IS/OOS Gap': row['delta_is_oos_gap']
-    }
+    fig = go.Figure(go.Bar(
+        x=labels,
+        y=values,
+        marker_color=colors,
+        text=[f"{v:+.4f}" for v in values],
+        textposition="outside",
+        textfont=dict(size=11),
+    ))
 
-    # Determinar colores (verde para valores positivos en Sharpe, negativos en otros)
-    colors = []
-    for name, value in deltas.items():
-        if name == 'Delta Sharpe':
-            colors.append('green' if value > 0 else 'red')
-        else:
-            colors.append('green' if value < 0 else 'red')
-
-    fig = go.Figure(data=[
-        go.Bar(
-            x=list(deltas.keys()),
-            y=list(deltas.values()),
-            marker_color=colors,
-            text=[f"{v:+.4f}" for v in deltas.values()],
-            textposition='outside'
-        )
-    ])
-
-    fig.update_layout(
-        title=title,
-        yaxis_title="Valor del Delta",
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50)
-    )
-
-    # Añadir línea en cero
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
-
+    fig.add_hline(y=0, line_color="#cbd5e0", line_width=1)
+    _base_layout(fig, "Componentes del IVL",
+                 yaxis_title="Valor del delta", height=300)
     return fig
 
 
-def create_price_vs_latent_plot(
-    df: pd.DataFrame,
-    title: str = "Precio Close vs Índice PCA"
-) -> go.Figure:
-    """
-    Crea un gráfico con precio close e índice PCA en dos ejes.
-
-    Args:
-        df: DataFrame con columnas sample, close, pca_index
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el gráfico de dos ejes
-    """
-    is_valid, error_msg = validate_dataframe(df, ['sample', 'close', 'pca_index'])
+def create_price_vs_latent_plot(df: pd.DataFrame) -> go.Figure:
+    """Precio Close vs Indice PCA en dos ejes."""
+    is_valid, error_msg = validate_dataframe(df, ["sample", "close", "pca_index"])
     if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+        return create_empty_figure(f"Sin datos: {error_msg}")
 
     fig = go.Figure()
-
-    # Eje izquierdo: precio close
     fig.add_trace(go.Scatter(
-        x=df['sample'],
-        y=df['close'],
-        name='Close',
-        line=dict(color='blue', width=1.5),
-        yaxis='y'
-    ))
-
-    # Eje derecho: pca_index
+        x=df["sample"], y=df["close"],
+        name="Close", line=dict(color=ACCENT, width=1.5), yaxis="y"))
     fig.add_trace(go.Scatter(
-        x=df['sample'],
-        y=df['pca_index'],
-        name='PCA Index',
-        line=dict(color='orange', width=1.5),
-        yaxis='y2'
-    ))
+        x=df["sample"], y=df["pca_index"],
+        name="PCA Index", line=dict(color="#b7791f", width=1.5), yaxis="y2"))
 
-    fig.update_layout(
-        title=title,
-        xaxis_title='Muestra',
-        yaxis=dict(
-            title=dict(text='Precio Close', font=dict(color='blue')),
-            tickfont=dict(color='blue')
-        ),
-        yaxis2=dict(
-            title=dict(text='Índice PCA', font=dict(color='orange')),
-            tickfont=dict(color='orange'),
-            overlaying='y',
-            side='right'
-        ),
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50),
-        legend=dict(x=0.01, y=0.99)
-    )
-
+    _base_layout(fig, "Precio Close vs Indice PCA",
+                 xaxis_title="Muestra", height=300,
+                 yaxis=dict(title="Close", titlefont=dict(color=ACCENT),
+                            tickfont=dict(color=ACCENT)),
+                 yaxis2=dict(title="PCA", titlefont=dict(color="#b7791f"),
+                             tickfont=dict(color="#b7791f"),
+                             overlaying="y", side="right"),
+                 legend=dict(font=dict(size=10), orientation="h",
+                             y=-0.22, x=0))
     return fig
 
 
-def create_latent_indices_plot(
-    df: pd.DataFrame,
-    title: str = "Comparación de Índices Latentes (Normalizados)"
-) -> go.Figure:
-    """
-    Crea un gráfico comparativo de índices latentes normalizados.
-
-    Args:
-        df: DataFrame con columnas sample, norm_index, first_component_index, pca_index
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el gráfico comparativo
-    """
-    is_valid, error_msg = validate_dataframe(df, ['sample', 'norm_index', 'first_component_index', 'pca_index'])
+def create_latent_indices_plot(df: pd.DataFrame) -> go.Figure:
+    """Comparacion de indices latentes normalizados."""
+    is_valid, error_msg = validate_dataframe(
+        df, ["sample", "norm_index", "first_component_index", "pca_index"])
     if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+        return create_empty_figure(f"Sin datos: {error_msg}")
 
-    # Normalizar índices
-    norm_index_norm = (df['norm_index'] - df['norm_index'].mean()) / df['norm_index'].std()
-    first_component_norm = (df['first_component_index'] - df['first_component_index'].mean()) / df['first_component_index'].std()
-    pca_index_norm = (df['pca_index'] - df['pca_index'].mean()) / df['pca_index'].std()
+    def norm(s):
+        std = s.std()
+        return (s - s.mean()) / std if std > 1e-8 else s
 
     fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=df['sample'],
-        y=norm_index_norm,
-        name='Norm Index (normalizado)',
-        line=dict(color='blue', width=1.5),
-        opacity=0.7
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df['sample'],
-        y=first_component_norm,
-        name='First Component Index (normalizado)',
-        line=dict(color='orange', width=1.5),
-        opacity=0.7
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df['sample'],
-        y=pca_index_norm,
-        name='PCA Index (normalizado)',
-        line=dict(color='green', width=1.5),
-        opacity=0.7
-    ))
-
-    fig.update_layout(
-        title=title,
-        xaxis_title='Muestra',
-        yaxis_title='Valor Normalizado',
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50),
-        legend=dict(x=0.01, y=0.99)
-    )
-
-    return fig
-
-
-def create_pca_vs_next_return_scatter(
-    df: pd.DataFrame,
-    title: str = "Índice PCA vs Retorno Siguiente"
-) -> go.Figure:
-    """
-    Crea un scatter plot entre índice PCA y retorno siguiente.
-
-    Args:
-        df: DataFrame con columnas pca_index, next_return
-        title: Título del gráfico
-
-    Returns:
-        Figura Plotly con el scatter plot
-    """
-    is_valid, error_msg = validate_dataframe(df, ['pca_index', 'next_return'])
-    if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
-
-    # Eliminar NaN
-    df_clean = df[['pca_index', 'next_return']].dropna()
-
-    if df_clean.empty:
-        return create_empty_figure("No hay datos válidos después de eliminar NaN")
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=df_clean['pca_index'],
-        y=df_clean['next_return'],
-        mode='markers',
-        marker=dict(
-            size=8,
-            color=df_clean['next_return'],
-            colorscale='RdYlGn',
-            showscale=True,
-            colorbar=dict(title='Retorno Siguiente')
-        ),
-        name='PCA vs Retorno'
-    ))
-
-    # Añadir línea de tendencia si hay suficientes datos
-    if len(df_clean) > 1:
-        z = np.polyfit(df_clean['pca_index'], df_clean['next_return'], 1)
-        p = np.poly1d(z)
-        x_trend = np.linspace(df_clean['pca_index'].min(), df_clean['pca_index'].max(), 100)
-        y_trend = p(x_trend)
-
+    for col, label, color in [
+        ("norm_index", "Norm", ACCENT),
+        ("first_component_index", "First Comp.", "#276749"),
+        ("pca_index", "PCA", "#b7791f"),
+    ]:
         fig.add_trace(go.Scatter(
-            x=x_trend,
-            y=y_trend,
-            mode='lines',
-            name='Tendencia',
-            line=dict(color='red', dash='dash')
-        ))
+            x=df["sample"], y=norm(df[col]),
+            name=label, line=dict(color=color, width=1.5), opacity=0.85))
 
-    fig.update_layout(
-        title=title,
-        xaxis_title='Índice PCA',
-        yaxis_title='Retorno Siguiente',
-        height=400,
-        margin=dict(l=50, r=50, t=50, b=50)
-    )
+    _base_layout(fig, "Indices Latentes (normalizados)",
+                 xaxis_title="Muestra", yaxis_title="Valor norm.",
+                 height=300,
+                 legend=dict(font=dict(size=10), orientation="h",
+                             y=-0.22, x=0))
+    return fig
 
-    # Añadir línea en cero
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
 
+def create_pca_vs_next_return_scatter(df: pd.DataFrame) -> go.Figure:
+    """Scatter Indice PCA vs Retorno siguiente."""
+    is_valid, error_msg = validate_dataframe(df, ["pca_index", "next_return"])
+    if not is_valid:
+        return create_empty_figure(f"Sin datos: {error_msg}")
+
+    df_c = df[["pca_index", "next_return"]].dropna()
+    if df_c.empty:
+        return create_empty_figure("Sin datos validos despues de eliminar NaN")
+
+    fig = go.Figure(go.Scatter(
+        x=df_c["pca_index"], y=df_c["next_return"],
+        mode="markers",
+        marker=dict(size=6, color=df_c["next_return"],
+                    colorscale="RdYlGn", showscale=True,
+                    colorbar=dict(title="Retorno sig.", thickness=10,
+                                  titlefont=dict(size=10))),
+    ))
+
+    if len(df_c) > 1:
+        z = np.polyfit(df_c["pca_index"], df_c["next_return"], 1)
+        x_t = np.linspace(df_c["pca_index"].min(), df_c["pca_index"].max(), 100)
+        fig.add_trace(go.Scatter(
+            x=x_t, y=np.poly1d(z)(x_t),
+            mode="lines", name="Tendencia",
+            line=dict(color="#c53030", dash="dash", width=1.5)))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e0", line_width=1)
+    _base_layout(fig, "PCA vs Retorno siguiente",
+                 xaxis_title="Indice PCA", yaxis_title="Retorno sig.",
+                 height=300, showlegend=False)
     return fig
