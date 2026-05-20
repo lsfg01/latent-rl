@@ -63,6 +63,36 @@ def records_to_dataframe(records):
     return pd.DataFrame(records)
 
 
+def get_first_existing_column(df: pd.DataFrame, candidates: list, required: bool = True):
+    """
+    Devuelve el primer nombre de columna de `candidates` que exista en `df`.
+
+    Permite que el dashboard sea compatible con el formato antiguo (mean_return)
+    y con el nuevo formato IS/OOS (mean_return_oos, mean_return_is, …).
+
+    Args:
+        df: DataFrame donde buscar
+        candidates: Lista de nombres candidatos, ordenados por preferencia
+        required: Si True, lanza KeyError cuando ningún candidato existe
+
+    Returns:
+        Nombre de la primera columna encontrada, o None si required=False y
+        ninguna columna existe.
+
+    Raises:
+        KeyError: Si required=True y ningún candidato se encuentra en df.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    if required:
+        raise KeyError(
+            f"No se encontró ninguna de estas columnas: {candidates}. "
+            f"Columnas disponibles: {df.columns.tolist()}"
+        )
+    return None
+
+
 def run_dashboard_data_scripts():
     """
     Ejecuta los scripts de generación de datos del dashboard.
@@ -163,12 +193,53 @@ missing_files = {
 # Filtrar solo archivos faltantes
 missing_files = {k: v for k, v in missing_files.items() if v}
 
+# ---------------------------------------------------------------------------
+# Detectar columnas disponibles — compatible con formato antiguo y nuevo IS/OOS
+# ---------------------------------------------------------------------------
+if agent_summary_df is not None and not agent_summary_df.empty:
+    AGENT_COL = get_first_existing_column(
+        agent_summary_df,
+        ["agent_name", "agent", "Agent"],
+    )
+    RETURN_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_return_oos", "mean_return", "mean_return_is",
+         "return_mean", "total_return_mean", "mean_total_return"],
+    )
+    STD_RETURN_COL = get_first_existing_column(
+        agent_summary_df,
+        ["std_return_oos", "seed_std_return_oos", "std_return", "seed_std_return",
+         "std_return_is", "seed_std_return_is"],
+        required=False,
+    )
+    TRADES_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_n_trades", "mean_trades", "n_trades_mean", "num_trades_mean", "trades_mean"],
+        required=False,
+    )
+    EQUITY_COL = get_first_existing_column(
+        agent_summary_df,
+        ["mean_final_equity_oos", "mean_final_equity", "final_equity_mean",
+         "mean_equity_oos", "mean_equity"],
+        required=False,
+    )
+else:
+    AGENT_COL = "agent_name"
+    RETURN_COL = "mean_return"
+    STD_RETURN_COL = None
+    TRADES_COL = None
+    EQUITY_COL = None
+
+# ---------------------------------------------------------------------------
 # Calcular KPIs si hay datos
+# ---------------------------------------------------------------------------
 kpi_data = {}
 if agent_summary_df is not None and not agent_summary_df.empty:
     kpi_data['num_agents'] = len(agent_summary_df)
-    kpi_data['best_agent'] = agent_summary_df.loc[agent_summary_df['mean_return'].idxmax(), 'agent_name']
-    kpi_data['best_return'] = agent_summary_df['mean_return'].max()
+    kpi_data['best_agent'] = agent_summary_df.loc[
+        agent_summary_df[RETURN_COL].idxmax(), AGENT_COL
+    ]
+    kpi_data['best_return'] = agent_summary_df[RETURN_COL].max()
 else:
     kpi_data['num_agents'] = 0
     kpi_data['best_agent'] = 'N/A'

@@ -37,6 +37,24 @@ def create_empty_figure(message: str = "No hay datos disponibles") -> go.Figure:
     return fig
 
 
+def _first_existing_col(df: pd.DataFrame, candidates: list, required: bool = True):
+    """
+    Devuelve el primer nombre de candidatos que exista en df.columns.
+
+    Versión local de get_first_existing_column usada internamente por las
+    funciones de figura para tolerar distintos formatos de CSV.
+    """
+    for col in candidates:
+        if col in df.columns:
+            return col
+    if required:
+        raise KeyError(
+            f"No se encontró ninguna de estas columnas: {candidates}. "
+            f"Columnas disponibles: {df.columns.tolist()}"
+        )
+    return None
+
+
 def validate_dataframe(df: pd.DataFrame, required_columns: list) -> Tuple[bool, str]:
     """
     Valida que un DataFrame tenga las columnas requeridas.
@@ -68,37 +86,59 @@ def create_agent_return_bar(
     """
     Crea un gráfico de barras con el retorno medio por agente.
 
+    Compatible con el formato antiguo (mean_return) y el nuevo IS/OOS
+    (mean_return_oos, mean_return_is). Prioriza OOS si está disponible.
+
     Args:
-        df: DataFrame con columnas agent_name, mean_return, std_return
+        df: DataFrame de agent_summary con columnas agent y return
         title: Título del gráfico
 
     Returns:
         Figura Plotly con el gráfico de barras
     """
-    is_valid, error_msg = validate_dataframe(df, ['agent_name', 'mean_return', 'std_return'])
-    if not is_valid:
-        return create_empty_figure(f"No hay datos disponibles: {error_msg}")
+    if df is None or df.empty:
+        return create_empty_figure("No hay datos de agentes disponibles")
+
+    # Detectar columnas — priorizar OOS
+    try:
+        agent_col = _first_existing_col(df, ["agent_name", "agent", "Agent"])
+        return_col = _first_existing_col(df, [
+            "mean_return_oos", "mean_return", "mean_return_is",
+            "return_mean", "total_return_mean", "mean_total_return",
+        ])
+    except KeyError as exc:
+        return create_empty_figure(f"Columnas no encontradas: {exc}")
+
+    std_col = _first_existing_col(df, [
+        "std_return_oos", "seed_std_return_oos", "std_return", "seed_std_return",
+        "std_return_is", "seed_std_return_is",
+    ], required=False)
+
+    # Etiqueta del eje X según la columna elegida
+    x_label = "Retorno OOS" if "oos" in return_col else "Retorno Medio"
+    if title == "Retorno Medio por Agente" and "oos" in return_col:
+        title = "Retorno Medio por Agente (OOS)"
 
     fig = go.Figure()
 
     for _, row in df.iterrows():
+        error_x = None
+        if std_col is not None:
+            error_x = dict(type='data', array=[row[std_col]], visible=True)
+
         fig.add_trace(go.Bar(
-            name=row['agent_name'],
-            x=[row['mean_return']],
-            y=[row['agent_name']],
+            name=row[agent_col],
+            x=[row[return_col]],
+            y=[row[agent_col]],
             orientation='h',
-            error_x=dict(
-                type='data',
-                array=[row['std_return']],
-                visible=True
-            ),
-            text=[f"{row['mean_return']:.4f}"],
+            error_x=error_x,
+            text=[f"{row[return_col]:.4f}"],
             textposition='outside'
         ))
 
     fig.update_layout(
         title=title,
-        xaxis_title="Retorno Medio",
+        xaxis_title=x_label,
         yaxis_title="Agente",
         barmode='group',
         height=400,
@@ -108,6 +148,27 @@ def create_agent_return_bar(
     return fig
 
 
+def _filter_split(df: pd.DataFrame, preferred: str = "oos") -> tuple:
+    """
+    Si el DataFrame tiene una columna 'split', filtra a las filas con el valor
+    preferido (por defecto 'oos'). Si no existe esa columna o el filtro devuelve
+    vacío, devuelve el DataFrame original y una etiqueta vacía.
+
+    Returns:
+        (df_filtered, label_suffix)  donde label_suffix indica el split activo.
+    """
+    if "split" not in df.columns:
+        return df, ""
+    filtered = df[df["split"] == preferred]
+    if filtered.empty:
+        return df, ""
+    return filtered, f" ({preferred.upper()})"
+
+
+def _detect_agent_col(df: pd.DataFrame) -> str:
+    return _first_existing_col(df, ["agent_name", "agent", "Agent"])
+
+
 def create_seed_return_boxplot(
     df: pd.DataFrame,
     title: str = "Distribución de Retornos por Semilla"
@@ -115,21 +176,30 @@ def create_seed_return_boxplot(
     """
     Crea un boxplot de retornos por semilla para cada agente.
 
+    Compatible con el formato nuevo que incluye columna 'split' (IS/OOS).
+    Cuando existe, filtra a OOS para mostrar la distribución de generalización.
+
     Args:
-        df: DataFrame con columnas agent_name, seed, total_return
+        df: DataFrame de agent_seed_metrics con columnas agent_name, seed, total_return
         title: Título del gráfico
 
     Returns:
         Figura Plotly con el boxplot
     """
-    is_valid, error_msg = validate_dataframe(df, ['agent_name', 'seed', 'total_return'])
+    is_valid, error_msg = validate_dataframe(df, ['seed', 'total_return'])
     if not is_valid:
         return create_empty_figure(f"No hay datos disponibles: {error_msg}")
 
+    try:
+        agent_col = _detect_agent_col(df)
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+
+    df_plot, split_label = _filter_split(df)
     fig = go.Figure()
 
-    for agent in df['agent_name'].unique():
-        agent_data = df[df['agent_name'] == agent]['total_return']
+    for agent in df_plot[agent_col].unique():
+        agent_data = df_plot[df_plot[agent_col] == agent]['total_return']
         fig.add_trace(go.Box(
             y=agent_data,
             name=agent,
@@ -139,7 +209,7 @@ def create_seed_return_boxplot(
         ))
 
     fig.update_layout(
-        title=title,
+        title=title + split_label,
         yaxis_title="Retorno Total",
         xaxis_title="Agente",
         height=400,
@@ -156,21 +226,30 @@ def create_seed_return_scatter(
     """
     Crea un scatter plot de retornos por semilla.
 
+    Compatible con el formato nuevo que incluye columna 'split' (IS/OOS).
+    Cuando existe, filtra a OOS para mostrar la evolución entre semillas.
+
     Args:
-        df: DataFrame con columnas agent_name, seed, total_return
+        df: DataFrame de agent_seed_metrics con columnas agent_name, seed, total_return
         title: Título del gráfico
 
     Returns:
         Figura Plotly con el scatter plot
     """
-    is_valid, error_msg = validate_dataframe(df, ['agent_name', 'seed', 'total_return'])
+    is_valid, error_msg = validate_dataframe(df, ['seed', 'total_return'])
     if not is_valid:
         return create_empty_figure(f"No hay datos disponibles: {error_msg}")
 
+    try:
+        agent_col = _detect_agent_col(df)
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+
+    df_plot, split_label = _filter_split(df)
     fig = go.Figure()
 
-    for agent in df['agent_name'].unique():
-        agent_data = df[df['agent_name'] == agent]
+    for agent in df_plot[agent_col].unique():
+        agent_data = df_plot[df_plot[agent_col] == agent]
         fig.add_trace(go.Scatter(
             x=agent_data['seed'],
             y=agent_data['total_return'],
@@ -181,7 +260,7 @@ def create_seed_return_scatter(
         ))
 
     fig.update_layout(
-        title=title,
+        title=title + split_label,
         xaxis_title="Semilla",
         yaxis_title="Retorno Total",
         height=400,

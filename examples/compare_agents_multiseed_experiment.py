@@ -51,7 +51,7 @@ def load_yfinance_data(
     Raises:
         ValueError: Si no se descarga ningún dato para el ticker/periodo indicado.
     """
-    print(f"  Descargando {ticker} ({start} → {end})...")
+    print(f"  Descargando {ticker} ({start} -> {end})...")
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
 
     if df.empty:
@@ -354,7 +354,7 @@ def run_single_seed(
 
     Returns:
         Diccionario con métricas IS y OOS de cada agente para esta semilla.
-        Claves: agent_name → {"is": {...}, "oos": {...}}
+        Claves: agent_name -> {"is": {...}, "oos": {...}}
     """
     print(f"\n--- Ejecutando semilla {seed} ---")
 
@@ -623,7 +623,7 @@ def main():
     print("\n1. CONFIGURACIÓN DEL EXPERIMENTO")
     print("-" * 120)
     print(f"Fuente de datos: Yahoo Finance  |  Ticker: {TICKER}")
-    print(f"Periodo: {START_DATE} → {END_DATE}  |  N_OBS: {'todos' if N_OBS is None else N_OBS}")
+    print(f"Periodo: {START_DATE} -> {END_DATE}  |  N_OBS: {'todos' if N_OBS is None else N_OBS}")
     print(f"Split IS/OOS: {int(TRAIN_RATIO*100)}% / {int((1-TRAIN_RATIO)*100)}%")
     print(f"Semillas (solo agentes): {SEEDS}")
     print("Entorno: FinancialEnv (lookback_window=10, initial_balance=$10,000, tc=0.1%)")

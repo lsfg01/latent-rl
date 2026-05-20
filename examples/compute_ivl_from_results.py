@@ -103,10 +103,10 @@ def main():
 
         print(f"\nIVL: {DIRECT_AGENT} vs {latent_name}")
         print(f"  IVL          = {result['ivl']:.4f}")
-        print(f"  Δ Sharpe     = {result['delta_sharpe']:.4f}")
-        print(f"  Δ MDD        = {result['delta_mdd']:.4f}")
-        print(f"  Δ Seed Std   = {result['delta_seed_std']:.4f}")
-        print(f"  Δ IS/OOS Gap = {result['delta_is_oos_gap']:.4f}")
+        print(f"  d Sharpe     = {result['delta_sharpe']:.4f}")
+        print(f"  d MDD        = {result['delta_mdd']:.4f}")
+        print(f"  d Seed Std   = {result['delta_seed_std']:.4f}")
+        print(f"  d IS/OOS Gap = {result['delta_is_oos_gap']:.4f}")
         print(f"  Interpretación: {result['interpretation']}")
 
     if not records:
