@@ -294,9 +294,9 @@ def create_price_vs_latent_plot(df: pd.DataFrame) -> go.Figure:
 
     _base_layout(fig, "Precio Close vs Indice PCA",
                  xaxis_title="Muestra", height=300,
-                 yaxis=dict(title="Close", titlefont=dict(color=ACCENT),
+                 yaxis=dict(title=dict(text="Close", font=dict(color=ACCENT)),
                             tickfont=dict(color=ACCENT)),
-                 yaxis2=dict(title="PCA", titlefont=dict(color="#b7791f"),
+                 yaxis2=dict(title=dict(text="PCA", font=dict(color="#b7791f")),
                              tickfont=dict(color="#b7791f"),
                              overlaying="y", side="right"),
                  legend=dict(font=dict(size=10), orientation="h",
@@ -348,8 +348,8 @@ def create_pca_vs_next_return_scatter(df: pd.DataFrame) -> go.Figure:
         mode="markers",
         marker=dict(size=6, color=df_c["next_return"],
                     colorscale="RdYlGn", showscale=True,
-                    colorbar=dict(title="Retorno sig.", thickness=10,
-                                  titlefont=dict(size=10))),
+                    colorbar=dict(title=dict(text="Retorno sig.", font=dict(size=10)),
+                                  thickness=10)),
     ))
 
     if len(df_c) > 1:
