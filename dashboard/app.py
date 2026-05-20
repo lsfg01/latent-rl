@@ -72,8 +72,8 @@ def run_dashboard_data_scripts():
     """
     scripts = [
         "examples/latent_index_example.py",
-        "examples/latent_advantage_example.py",
-        "examples/compare_agents_multiseed_experiment.py"
+        "examples/compare_agents_multiseed_experiment.py",
+        "examples/compute_ivl_from_results.py",
     ]
 
     log_lines = []

@@ -303,3 +303,52 @@ class TestLatentAdvantageIndex:
         # Valores fuera del umbral
         assert ivl_calculator.interpret(0.02) == "latent_advantage"
         assert ivl_calculator.interpret(-0.02) == "direct_advantage"
+
+    # ------------------------------------------------------------------
+    # Convención de signo de max_drawdown
+    # ------------------------------------------------------------------
+
+    def test_negative_mdd_values_same_result_as_positive(self):
+        """Pasar max_drawdown negativo (convención FinancialMetrics) da el mismo resultado que positivo."""
+        ivl_calculator = LatentAdvantageIndex()
+
+        # Métricas con magnitudes positivas (convención del ejemplo del TFM)
+        direct_pos = {"sharpe": 1.0, "max_drawdown": 0.25, "seed_std": 0.1, "perf_is": 0.15, "perf_oos": 0.12}
+        latent_pos = {"sharpe": 1.5, "max_drawdown": 0.15, "seed_std": 0.05, "perf_is": 0.18, "perf_oos": 0.16}
+
+        # Métricas equivalentes con signo negativo (convención de FinancialMetrics.max_drawdown())
+        direct_neg = {**direct_pos, "max_drawdown": -0.25}
+        latent_neg = {**latent_pos, "max_drawdown": -0.15}
+
+        result_pos = ivl_calculator.compute(direct_pos, latent_pos)
+        result_neg = ivl_calculator.compute(direct_neg, latent_neg)
+
+        assert result_pos["ivl"] == pytest.approx(result_neg["ivl"])
+        assert result_pos["delta_mdd"] == pytest.approx(result_neg["delta_mdd"])
+        assert result_pos["interpretation"] == result_neg["interpretation"]
+
+    def test_mdd_delta_sign_is_correct(self):
+        """delta_mdd negativo cuando el agente latente tiene menor drawdown (ventaja latente)."""
+        ivl_calculator = LatentAdvantageIndex()
+
+        direct = {"sharpe": 1.0, "max_drawdown": 0.30, "seed_std": 0.1, "perf_is": 0.15, "perf_oos": 0.14}
+        latent = {"sharpe": 1.0, "max_drawdown": 0.10, "seed_std": 0.1, "perf_is": 0.15, "perf_oos": 0.14}
+
+        result = ivl_calculator.compute(direct, latent)
+
+        # Latente tiene menor MDD → delta_mdd negativo → - w2 * delta_mdd positivo → IVL sube
+        assert result["delta_mdd"] < 0
+        assert result["ivl"] > 0
+
+    def test_mdd_delta_sign_is_correct_with_negative_convention(self):
+        """Misma lógica con convención negativa de FinancialMetrics."""
+        ivl_calculator = LatentAdvantageIndex()
+
+        direct = {"sharpe": 1.0, "max_drawdown": -0.30, "seed_std": 0.1, "perf_is": 0.15, "perf_oos": 0.14}
+        latent = {"sharpe": 1.0, "max_drawdown": -0.10, "seed_std": 0.1, "perf_is": 0.15, "perf_oos": 0.14}
+
+        result = ivl_calculator.compute(direct, latent)
+
+        # Comportamiento idéntico al test anterior
+        assert result["delta_mdd"] < 0
+        assert result["ivl"] > 0

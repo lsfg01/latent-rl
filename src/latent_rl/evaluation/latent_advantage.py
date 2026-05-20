@@ -7,10 +7,17 @@ que utiliza representaciones latentes frente a un agente directo.
 IVL = w1 * delta_sharpe - w2 * delta_mdd - w3 * delta_seed_std - w4 * delta_is_oos_gap
 
 donde:
-- delta_sharpe = sharpe_latent - sharpe_direct
-- delta_mdd = max_drawdown_latent - max_drawdown_direct
-- delta_seed_std = seed_std_latent - seed_std_direct
+- delta_sharpe    = sharpe_latent - sharpe_direct           (mayor es mejor → positivo = ventaja latente)
+- delta_mdd       = |mdd_latent| - |mdd_direct|             (MAGNITUD del drawdown, valor positivo)
+- delta_seed_std  = seed_std_latent - seed_std_direct        (menor std es mejor → negativo = ventaja latente)
 - delta_is_oos_gap = |perf_is_latent - perf_oos_latent| - |perf_is_direct - perf_oos_direct|
+
+Convención de max_drawdown:
+    El campo "max_drawdown" en las métricas debe ser la MAGNITUD del drawdown
+    (valor positivo, ej: 0.25 para una caída máxima del 25%).
+    Si se usa FinancialMetrics.max_drawdown(), que devuelve un valor negativo,
+    hay que pasar abs(max_drawdown) antes de construir el diccionario de métricas.
+    El IVL aplica abs() internamente para tolerar ambas convenciones.
 """
 
 from typing import Dict, Optional
@@ -133,7 +140,8 @@ class LatentAdvantageIndex:
 
         # Calcular deltas
         delta_sharpe = latent_metrics["sharpe"] - direct_metrics["sharpe"]
-        delta_mdd = latent_metrics["max_drawdown"] - direct_metrics["max_drawdown"]
+        # abs() para tolerar tanto valores positivos (magnitud) como negativos (convención de FinancialMetrics)
+        delta_mdd = abs(latent_metrics["max_drawdown"]) - abs(direct_metrics["max_drawdown"])
         delta_seed_std = latent_metrics["seed_std"] - direct_metrics["seed_std"]
 
         # Calcular delta_is_oos_gap

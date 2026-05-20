@@ -111,7 +111,8 @@ class FinancialMetrics:
             returns: Serie de retornos
 
         Returns:
-            Drawdown máximo (valor negativo)
+            Drawdown máximo como valor negativo o cero (ej: -0.25 = caída máxima del 25%).
+            Para usar esta métrica en LatentAdvantageIndex, pasar abs(max_drawdown).
         """
         if isinstance(returns, pd.Series):
             returns = returns.values

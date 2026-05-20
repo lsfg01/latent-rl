@@ -56,9 +56,10 @@ class FinancialEnv(BaseFinancialEnv):
         self.current_step = 0
         self.cash = initial_balance
         self.position_units = 0.0
-        self.position = 0  # 0=flat, 1=long, -1=short (no implementado)
+        self.position = 0  # 0=flat, 1=long
         self.entry_price = 0.0
-        self.realized_profit = 0.0  # Profit/pérdida realizada tras cerrar posición
+        self.realized_profit = 0.0  # Acumulado de profit/pérdida de trades cerrados
+        self._cash_at_last_buy = 0.0  # Cash invertido en el último buy (para calcular profit del trade)
         self.trade_history = []
         self.previous_equity = initial_balance
 
@@ -82,6 +83,7 @@ class FinancialEnv(BaseFinancialEnv):
         self.position = 0
         self.entry_price = 0.0
         self.realized_profit = 0.0
+        self._cash_at_last_buy = 0.0
         self.trade_history = []
         self.previous_equity = self.initial_balance
 
@@ -196,6 +198,7 @@ class FinancialEnv(BaseFinancialEnv):
         elif action == 1:
             if self.position == 0:
                 # Abrir posición long: invertir todo el cash disponible
+                self._cash_at_last_buy = self.cash  # guardar cash antes de invertir
                 cost = self.cash * self.transaction_cost
                 cash_after_cost = self.cash - cost
                 self.position_units = cash_after_cost / current_price
@@ -223,8 +226,10 @@ class FinancialEnv(BaseFinancialEnv):
                 cost = proceeds * self.transaction_cost
                 self.cash = proceeds - cost
 
-                # Calcular profit realizado
-                self.realized_profit = self.cash - self.initial_balance
+                # Acumular profit realizado de este trade
+                trade_profit = self.cash - self._cash_at_last_buy
+                self.realized_profit += trade_profit
+                self._cash_at_last_buy = 0.0
 
                 # Registrar trade
                 self.trade_history.append({
