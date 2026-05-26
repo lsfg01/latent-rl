@@ -1,8 +1,9 @@
-"""Módulo de experimentación para comparación de agentes."""
+"""Modulo de experimentacion para comparacion de agentes."""
 
 from .config import ExperimentConfig
 from .utils import (
     load_yfinance_data,
+    load_tickers_data,
     split_data,
     select_action_for_evaluation,
     evaluate_agent,
@@ -17,6 +18,8 @@ from .runner import (
     run_single_seed,
     compute_ivl,
     export_ivl_results,
+    aggregate_ticker_results,
+    export_cross_ticker_results,
     run_experiment,
 )
 
@@ -25,6 +28,7 @@ __all__ = [
     "ExperimentConfig",
     # utils
     "load_yfinance_data",
+    "load_tickers_data",
     "split_data",
     "select_action_for_evaluation",
     "evaluate_agent",
@@ -38,5 +42,7 @@ __all__ = [
     "run_single_seed",
     "compute_ivl",
     "export_ivl_results",
+    "aggregate_ticker_results",
+    "export_cross_ticker_results",
     "run_experiment",
 ]

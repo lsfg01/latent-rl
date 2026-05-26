@@ -1,4 +1,4 @@
-"""Módulo de componentes del dashboard."""
+"""Modulo de componentes del dashboard."""
 
 from .cards import create_kpi_card, create_ivl_card, create_ivl_kpi_card, create_delta_card
 from .figures import (
@@ -8,7 +8,8 @@ from .figures import (
     create_ivl_delta_bar,
     create_price_vs_latent_plot,
     create_latent_indices_plot,
-    create_pca_vs_next_return_scatter
+    create_pca_vs_next_return_scatter,
+    create_cross_ticker_ivl_chart,
 )
 
 __all__ = [
@@ -22,5 +23,6 @@ __all__ = [
     "create_ivl_delta_bar",
     "create_price_vs_latent_plot",
     "create_latent_indices_plot",
-    "create_pca_vs_next_return_scatter"
+    "create_pca_vs_next_return_scatter",
+    "create_cross_ticker_ivl_chart",
 ]
