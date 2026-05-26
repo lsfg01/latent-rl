@@ -1,5 +1,6 @@
 """Módulo de experimentación para comparación de agentes."""
 
+from .config import ExperimentConfig
 from .utils import (
     load_yfinance_data,
     split_data,
@@ -14,9 +15,14 @@ from .runner import (
     train_dqn_agent,
     train_latent_dqn_agent,
     run_single_seed,
+    compute_ivl,
+    export_ivl_results,
+    run_experiment,
 )
 
 __all__ = [
+    # config
+    "ExperimentConfig",
     # utils
     "load_yfinance_data",
     "split_data",
@@ -30,4 +36,7 @@ __all__ = [
     "train_dqn_agent",
     "train_latent_dqn_agent",
     "run_single_seed",
+    "compute_ivl",
+    "export_ivl_results",
+    "run_experiment",
 ]
