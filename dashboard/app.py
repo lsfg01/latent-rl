@@ -4,6 +4,10 @@ Dashboard de Ventaja Latente
 Aplicacion Dash interactiva para visualizar comparaciones de agentes RL
 y el Indice de Ventaja Latente (IVL).
 
+Soporta experimentos con uno o varios tickers:
+- Un ticker:        resultados en results/{ticker}/
+- Varios tickers:   resultados en results/{ticker}/ + cross-ticker en results/
+
 La logica de datos y calculos no se modifica en este fichero.
 Solo se define el layout y los callbacks de actualizacion.
 """
@@ -22,7 +26,11 @@ import subprocess
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from dashboard.data import load_all_dashboard_data
+from dashboard.data import (
+    load_all_dashboard_data,
+    get_available_tickers,
+    load_ticker_comparison,
+)
 from dashboard.components import (
     create_kpi_card,
     create_ivl_card,
@@ -35,6 +43,7 @@ from dashboard.components import (
     create_price_vs_latent_plot,
     create_latent_indices_plot,
     create_pca_vs_next_return_scatter,
+    create_cross_ticker_ivl_chart,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,7 +85,7 @@ TABLE_CELL_COND = [
 
 
 # ---------------------------------------------------------------------------
-# Helpers de serialización
+# Helpers de serializacion
 # ---------------------------------------------------------------------------
 
 def dataframe_to_records(df):
@@ -177,25 +186,31 @@ def run_dashboard_data_scripts():
 # Carga inicial de datos
 # ---------------------------------------------------------------------------
 print("Cargando datos del dashboard...")
-raw_dashboard_data = load_all_dashboard_data()
+
+available_tickers = get_available_tickers()
+initial_ticker = available_tickers[0] if available_tickers else None
+
+raw_dashboard_data = load_all_dashboard_data(ticker=initial_ticker)
 
 agent_summary_df,      agent_summary_error      = raw_dashboard_data["agent_summary"]
 agent_seed_metrics_df, agent_seed_metrics_error  = raw_dashboard_data["agent_seed_metrics"]
 ivl_results_df,        ivl_results_error         = raw_dashboard_data["ivl_results"]
 latent_index_df,       latent_index_error         = raw_dashboard_data["latent_index"]
+ticker_comparison_df,  ticker_comparison_error    = raw_dashboard_data["ticker_comparison"]
 
 dashboard_data_serializable = {
     "agent_summary":      dataframe_to_records(agent_summary_df),
     "agent_seed_metrics": dataframe_to_records(agent_seed_metrics_df),
     "ivl_results":        dataframe_to_records(ivl_results_df),
     "latent_index":       dataframe_to_records(latent_index_df),
+    "ticker_comparison":  dataframe_to_records(ticker_comparison_df),
 }
 
 missing_files = {k: v for k, v in {
     "agent_summary.csv":      agent_summary_error,
     "agent_seed_metrics.csv": agent_seed_metrics_error,
     "ivl_results.csv":        ivl_results_error,
-    "latent_index.csv":       latent_index_error,
+    "latent_index_data.csv":  latent_index_error,
 }.items() if v}
 
 # ---------------------------------------------------------------------------
@@ -223,8 +238,8 @@ if agent_summary_df is not None and not agent_summary_df.empty:
          "mean_equity_oos", "mean_equity"],
         required=False)
 else:
-    AGENT_COL     = "agent_name"
-    RETURN_COL    = "mean_return"
+    AGENT_COL      = "agent_name"
+    RETURN_COL     = "mean_return"
     STD_RETURN_COL = None
     TRADES_COL     = None
     EQUITY_COL     = None
@@ -272,6 +287,32 @@ def _missing_files_alert():
         for fname, msg in missing_files.items()
     ]
     return html.Div(alerts, style={"marginBottom": "8px"})
+
+
+def _ticker_selector_row():
+    """
+    Fila del selector de ticker.
+
+    Visible cuando hay mas de un ticker disponible; oculta pero presente
+    en el DOM cuando hay cero o un ticker (para que los callbacks funcionen).
+    """
+    style = (
+        {"display": "flex"} if len(available_tickers) > 1
+        else {"display": "none"}
+    )
+    options = [{"label": t, "value": t} for t in available_tickers]
+    value   = available_tickers[0] if available_tickers else None
+
+    return html.Div([
+        html.Span("Ticker:", className="ticker-selector-label"),
+        dcc.Dropdown(
+            id="ticker-selector",
+            options=options,
+            value=value,
+            clearable=False,
+            style={"minWidth": "180px", "fontSize": "14px"},
+        ),
+    ], className="ticker-selector-row", style=style)
 
 
 def _control_panel():
@@ -336,6 +377,8 @@ def _section(title, *children, class_extra=""):
 # ---------------------------------------------------------------------------
 
 def create_layout():
+    show_cross_ticker = len(available_tickers) > 1
+
     return html.Div([
         dcc.Store(id="dashboard-data", data=dashboard_data_serializable),
 
@@ -357,6 +400,9 @@ def create_layout():
 
             # KPIs
             _kpi_row(),
+
+            # Selector de ticker (visible solo si >1 ticker)
+            _ticker_selector_row(),
 
             # ── Seccion IVL ─────────────────────────────────────────────────
             _section("Indice de Ventaja Latente (IVL)",
@@ -380,6 +426,18 @@ def create_layout():
                 # Grafica de deltas
                 html.Div(id="ivl-delta-chart", className="graph-container"),
             ),
+
+            # ── Comparacion cross-ticker (solo si hay >1 ticker) ─────────────
+            html.Div([
+                html.Div("Comparacion Cross-Ticker", className="section-title"),
+                html.P(
+                    "IVL calculado de forma independiente para cada activo. "
+                    "Permite evaluar si la ventaja latente es consistente entre mercados.",
+                    className="cross-ticker-note",
+                ),
+                html.Div(id="cross-ticker-chart", className="graph-container"),
+            ], className="section",
+               style={} if show_cross_ticker else {"display": "none"}),
 
             # ── Comparacion de agentes ───────────────────────────────────────
             _section("Comparacion de Agentes",
@@ -461,10 +519,11 @@ app.layout = create_layout()
     Output("generate-btn",      "disabled"),
     Input("generate-btn",       "n_clicks"),
     Input("reload-btn",         "n_clicks"),
+    Input("ticker-selector",    "value"),
     State("dashboard-data",     "data"),
     prevent_initial_call=True,
 )
-def update_dashboard_data(generate_clicks, reload_clicks, current_data):
+def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, current_data):
     ctx = dash.callback_context
     if not ctx.triggered:
         return current_data, html.Div(), html.Div(), "Listo", "ready", False
@@ -475,12 +534,16 @@ def update_dashboard_data(generate_clicks, reload_clicks, current_data):
         success, log, error = run_dashboard_data_scripts()
         if success:
             try:
-                raw = load_all_dashboard_data()
+                # Volver a detectar tickers despues de generar
+                new_tickers  = get_available_tickers()
+                load_ticker  = new_tickers[0] if new_tickers else None
+                raw = load_all_dashboard_data(ticker=load_ticker)
                 new_data = {
                     "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
                     "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                     "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
                     "latent_index":       dataframe_to_records(raw["latent_index"][0]),
+                    "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
                 }
                 return (new_data,
                         html.Div("Datos generados y cargados correctamente",
@@ -499,18 +562,23 @@ def update_dashboard_data(generate_clicks, reload_clicks, current_data):
                     html.Div(log, className="run-log"),
                     "Error", "error", False)
 
-    elif button_id == "reload-btn":
+    elif button_id in ("reload-btn", "ticker-selector"):
+        # Recargar datos para el ticker seleccionado (o auto-detectar si es None)
         try:
-            raw = load_all_dashboard_data()
+            raw = load_all_dashboard_data(ticker=selected_ticker)
             new_data = {
                 "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
                 "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                 "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
                 "latent_index":       dataframe_to_records(raw["latent_index"][0]),
+                "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
             }
+            if button_id == "ticker-selector":
+                label = f"Datos cargados para ticker: {selected_ticker or 'auto'}"
+            else:
+                label = "Datos recargados desde los CSV existentes"
             return (new_data,
-                    html.Div("Datos recargados desde los CSV existentes",
-                             className="alert alert-success"),
+                    html.Div(label, className="alert alert-success"),
                     html.Div("", className="run-log"),
                     "Recargado", "completed", False)
         except Exception as exc:
@@ -551,6 +619,27 @@ def update_ivl_section(data):
     except Exception as exc:
         err = html.Div(f"Error IVL: {exc}", style={"color": "#c53030"})
         return err, err
+
+
+@app.callback(
+    Output("cross-ticker-chart", "children"),
+    Input("dashboard-data",      "data"),
+)
+def update_cross_ticker(data):
+    try:
+        ct_df = records_to_dataframe(data.get("ticker_comparison"))
+        if ct_df is None or ct_df.empty:
+            return html.Div(
+                "Sin datos cross-ticker. Ejecuta el experimento con varios tickers.",
+                style={"color": "#718096", "fontSize": "0.9em"},
+            )
+        chart = dcc.Graph(
+            figure=create_cross_ticker_ivl_chart(ct_df),
+            config={"displayModeBar": False},
+        )
+        return chart
+    except Exception as exc:
+        return html.Div(f"Error cross-ticker: {exc}", style={"color": "#c53030"})
 
 
 @app.callback(
@@ -646,6 +735,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Dashboard de Ventaja Latente")
     print("=" * 60)
+
+    if available_tickers:
+        print(f"\nTickers disponibles: {available_tickers}")
     print("\nhttp://127.0.0.1:8050")
     print("Ctrl+C para detener\n")
 

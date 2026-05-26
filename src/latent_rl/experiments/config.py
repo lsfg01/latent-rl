@@ -10,13 +10,20 @@ Ejemplo::
 
     from latent_rl.experiments import ExperimentConfig, run_experiment
 
+    # Un solo ticker (comportamiento previo)
     config = ExperimentConfig(
-        ticker="AAPL",
+        tickers=["SPY"],
         seeds=[0, 1, 2],
         latent_dim=8,
         ivl_weights={"sharpe": 0.4, "mdd": 0.3, "seed_std": 0.15, "is_oos_gap": 0.15},
     )
-    run_experiment(config)
+
+    # Varios tickers — mismo experimento, datos distintos
+    config_multi = ExperimentConfig(
+        tickers=["SPY", "AAPL", "BTC-USD"],
+        seeds=[0, 1, 2],
+    )
+    run_experiment(config_multi)
 """
 
 from __future__ import annotations
@@ -33,7 +40,10 @@ class ExperimentConfig:
     con valores por defecto reproducibles. El objeto se valida al crearse.
 
     Attributes:
-        ticker: Símbolo del activo a descargar de Yahoo Finance.
+        tickers: Lista de símbolos de activos a descargar de Yahoo Finance.
+            Un ticker ejecuta el experimento una vez; varios tickers lo
+            ejecutan de forma independiente y generan una comparación cross-ticker.
+            Ejemplos: ``["SPY"]``, ``["SPY", "AAPL", "BTC-USD"]``.
         start_date: Fecha de inicio del histórico (formato YYYY-MM-DD).
         end_date: Fecha de fin del histórico (formato YYYY-MM-DD).
         n_obs: Si se especifica, recorta las últimas n_obs filas del histórico.
@@ -89,7 +99,7 @@ class ExperimentConfig:
     """
 
     # ── Datos ────────────────────────────────────────────────────────────────
-    ticker:      str           = "SPY"
+    tickers:     List[str]     = field(default_factory=lambda: ["SPY"])
     start_date:  str           = "2020-01-01"
     end_date:    str           = "2023-12-31"
     n_obs:       Optional[int] = None
@@ -159,6 +169,17 @@ class ExperimentConfig:
 
     def __post_init__(self) -> None:
         """Valida los valores de configuración al construir el objeto."""
+        if not self.tickers:
+            raise ValueError("tickers no puede estar vacío")
+        if any(not t or not t.strip() for t in self.tickers):
+            raise ValueError(
+                f"Todos los tickers deben ser strings no vacíos, got {self.tickers}"
+            )
+        if len(self.tickers) != len(set(self.tickers)):
+            dupes = [t for t in self.tickers if self.tickers.count(t) > 1]
+            raise ValueError(
+                f"tickers contiene duplicados: {list(set(dupes))}"
+            )
         if not 0.0 < self.train_ratio < 1.0:
             raise ValueError(
                 f"train_ratio debe estar en (0, 1), got {self.train_ratio}"

@@ -10,11 +10,16 @@ Uso::
 
     python examples/compare_agents_multiseed_experiment.py
 
-Salida::
+Salida (un ticker)::
 
-    results/agent_summary.csv       -- metricas IS/OOS agregadas por agente
-    results/agent_seed_metrics.csv  -- metricas por (agente, semilla, split)
-    results/ivl_results.csv         -- IVL por par (directo, latente)
+    results/SPY/agent_summary.csv       -- metricas IS/OOS agregadas por agente
+    results/SPY/agent_seed_metrics.csv  -- metricas por (agente, semilla, split)
+    results/SPY/ivl_results.csv         -- IVL por par (directo, latente)
+
+Salida (varios tickers)::
+
+    results/{ticker}/...                -- resultados por ticker
+    results/ticker_comparison.csv       -- comparacion cross-ticker del IVL
 """
 
 from latent_rl.experiments import ExperimentConfig, run_experiment
@@ -22,9 +27,10 @@ from latent_rl.experiments import ExperimentConfig, run_experiment
 # Personaliza aqui tu experimento.
 # Solo cambia los campos que quieras modificar; el resto usa los valores por
 # defecto definidos en ExperimentConfig.
+# Para varios tickers: tickers=["SPY", "AAPL", "BTC-USD"]
 config = ExperimentConfig(
     # Datos
-    ticker="SPY",
+    tickers=["SPY"],
     start_date="2020-01-01",
     end_date="2023-12-31",
     n_obs=None,           # None = todo el rango; int = ultimas N filas

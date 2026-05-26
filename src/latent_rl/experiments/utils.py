@@ -66,6 +66,41 @@ def load_yfinance_data(
     return df
 
 
+def load_tickers_data(
+    tickers: List[str],
+    start: str,
+    end: str,
+    n_obs: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Descarga datos OHLCV para múltiples tickers de Yahoo Finance.
+
+    Cada ticker se descarga de forma independiente. Si alguno falla, se
+    propaga el error inmediatamente indicando qué ticker causó el problema.
+
+    Args:
+        tickers: Lista de símbolos (p. ej. ["SPY", "AAPL", "BTC-USD"]).
+        start: Fecha de inicio en formato "YYYY-MM-DD".
+        end: Fecha de fin en formato "YYYY-MM-DD".
+        n_obs: Si se especifica, recorta las últimas n_obs filas por ticker.
+
+    Returns:
+        Diccionario ``{ticker: DataFrame}`` con columnas OHLCV lowercase.
+
+    Raises:
+        ValueError: Si algún ticker no devuelve datos.
+    """
+    result: Dict[str, pd.DataFrame] = {}
+    for ticker in tickers:
+        try:
+            result[ticker] = load_yfinance_data(
+                ticker=ticker, start=start, end=end, n_obs=n_obs
+            )
+        except ValueError as exc:
+            raise ValueError(f"Error al cargar ticker '{ticker}': {exc}") from exc
+    return result
+
+
 def split_data(
     data: pd.DataFrame,
     train_ratio: float = 0.7,

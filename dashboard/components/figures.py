@@ -365,3 +365,51 @@ def create_pca_vs_next_return_scatter(df: pd.DataFrame) -> go.Figure:
                  xaxis_title="Indice PCA", yaxis_title="Retorno sig.",
                  height=300, showlegend=False)
     return fig
+
+
+def create_cross_ticker_ivl_chart(df: pd.DataFrame) -> go.Figure:
+    """
+    Barras agrupadas del IVL por ticker y agente latente.
+
+    Muestra como varia el IVL entre distintos activos, lo que permite
+    evaluar la consistencia de la ventaja latente entre mercados.
+
+    Args:
+        df: DataFrame con columnas ``ticker``, ``latent_agent``, ``ivl``.
+            Puede contener filas de resumen (ticker == "MEAN" o "STD")
+            que se excluyen automaticamente.
+
+    Returns:
+        Figura Plotly con barras agrupadas por ticker.
+    """
+    if df is None or df.empty:
+        return create_empty_figure("Sin datos cross-ticker disponibles")
+
+    detail = df[~df["ticker"].isin(["MEAN", "STD"])].copy()
+    if detail.empty:
+        return create_empty_figure("Sin datos de tickers individuales")
+
+    latent_agents = detail["latent_agent"].unique()
+
+    fig = go.Figure()
+    for i, latent_agent in enumerate(latent_agents):
+        sub = detail[detail["latent_agent"] == latent_agent]
+        color = AGENT_COLORS[i % len(AGENT_COLORS)]
+        ivl_vals = sub["ivl"].tolist()
+        fig.add_trace(go.Bar(
+            name=latent_agent,
+            x=sub["ticker"].tolist(),
+            y=ivl_vals,
+            marker_color=color,
+            text=[f"{v:+.3f}" for v in ivl_vals],
+            textposition="outside",
+            cliponaxis=False,
+        ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="#718096", line_width=1.5)
+    _base_layout(fig, "IVL por Ticker y Agente Latente",
+                 xaxis_title="Ticker", yaxis_title="IVL",
+                 height=360,
+                 barmode="group",
+                 legend=dict(font=dict(size=10), orientation="h", y=-0.28, x=0))
+    return fig
