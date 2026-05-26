@@ -6,9 +6,6 @@ from .figures import (
     create_seed_return_boxplot,
     create_seed_return_scatter,
     create_ivl_delta_bar,
-    create_price_vs_latent_plot,
-    create_latent_indices_plot,
-    create_pca_vs_next_return_scatter,
     create_cross_ticker_ivl_chart,
 )
 
@@ -21,8 +18,5 @@ __all__ = [
     "create_seed_return_boxplot",
     "create_seed_return_scatter",
     "create_ivl_delta_bar",
-    "create_price_vs_latent_plot",
-    "create_latent_indices_plot",
-    "create_pca_vs_next_return_scatter",
     "create_cross_ticker_ivl_chart",
 ]

@@ -40,9 +40,6 @@ from dashboard.components import (
     create_seed_return_boxplot,
     create_seed_return_scatter,
     create_ivl_delta_bar,
-    create_price_vs_latent_plot,
-    create_latent_indices_plot,
-    create_pca_vs_next_return_scatter,
     create_cross_ticker_ivl_chart,
 )
 
@@ -133,7 +130,6 @@ def run_dashboard_data_scripts():
         tuple: (success: bool, log: str, error: str or None)
     """
     scripts = [
-        "examples/latent_index_example.py",
         "examples/compare_agents_multiseed_experiment.py",
         "examples/compute_ivl_from_results.py",
     ]
@@ -195,14 +191,12 @@ raw_dashboard_data = load_all_dashboard_data(ticker=initial_ticker)
 agent_summary_df,      agent_summary_error      = raw_dashboard_data["agent_summary"]
 agent_seed_metrics_df, agent_seed_metrics_error  = raw_dashboard_data["agent_seed_metrics"]
 ivl_results_df,        ivl_results_error         = raw_dashboard_data["ivl_results"]
-latent_index_df,       latent_index_error         = raw_dashboard_data["latent_index"]
 ticker_comparison_df,  ticker_comparison_error    = raw_dashboard_data["ticker_comparison"]
 
 dashboard_data_serializable = {
     "agent_summary":      dataframe_to_records(agent_summary_df),
     "agent_seed_metrics": dataframe_to_records(agent_seed_metrics_df),
     "ivl_results":        dataframe_to_records(ivl_results_df),
-    "latent_index":       dataframe_to_records(latent_index_df),
     "ticker_comparison":  dataframe_to_records(ticker_comparison_df),
 }
 
@@ -210,7 +204,6 @@ missing_files = {k: v for k, v in {
     "agent_summary.csv":      agent_summary_error,
     "agent_seed_metrics.csv": agent_seed_metrics_error,
     "ivl_results.csv":        ivl_results_error,
-    "latent_index_data.csv":  latent_index_error,
 }.items() if v}
 
 # ---------------------------------------------------------------------------
@@ -455,20 +448,6 @@ def create_layout():
                 ], className="chart-grid"),
             ),
 
-            # ── Espacio latente (auxiliar) ───────────────────────────────────
-            _section("Espacio Latente (Analisis Auxiliar)",
-                html.P(
-                    "Analisis auxiliar del espacio latente. "
-                    "No corresponde al IVL principal del TFM.",
-                    className="auxiliary-note",
-                ),
-                html.Div([
-                    html.Div(id="price-vs-latent-chart",  className="graph-container"),
-                    html.Div(id="latent-indices-chart",   className="graph-container"),
-                    html.Div(id="pca-vs-return-chart",    className="graph-container"),
-                ], className="chart-grid-3"),
-            ),
-
             # ── Notas metodologicas ──────────────────────────────────────────
             _section("Notas Metodologicas",
                 html.Div([
@@ -542,7 +521,6 @@ def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, curre
                     "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
                     "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                     "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
-                    "latent_index":       dataframe_to_records(raw["latent_index"][0]),
                     "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
                 }
                 return (new_data,
@@ -570,7 +548,6 @@ def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, curre
                 "agent_summary":      dataframe_to_records(raw["agent_summary"][0]),
                 "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                 "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
-                "latent_index":       dataframe_to_records(raw["latent_index"][0]),
                 "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
             }
             if button_id == "ticker-selector":
@@ -700,32 +677,6 @@ def update_seed_metrics(data):
     except Exception as exc:
         err = html.Div(f"Error metricas por semilla: {exc}", style={"color": "#c53030"})
         return err, err
-
-
-@app.callback(
-    Output("price-vs-latent-chart", "children"),
-    Output("latent-indices-chart",  "children"),
-    Output("pca-vs-return-chart",   "children"),
-    Input("dashboard-data",         "data"),
-)
-def update_latent_space(data):
-    try:
-        latent_df = records_to_dataframe(data.get("latent_index"))
-        if latent_df is None or latent_df.empty:
-            msg = html.Div("No hay datos de indice latente disponibles",
-                           style={"color": "#718096"})
-            return msg, msg, msg
-
-        price_chart   = dcc.Graph(figure=create_price_vs_latent_plot(latent_df),
-                                  config={"displayModeBar": False})
-        indices_chart = dcc.Graph(figure=create_latent_indices_plot(latent_df),
-                                  config={"displayModeBar": False})
-        pca_chart     = dcc.Graph(figure=create_pca_vs_next_return_scatter(latent_df),
-                                  config={"displayModeBar": False})
-        return price_chart, indices_chart, pca_chart
-    except Exception as exc:
-        err = html.Div(f"Error espacio latente: {exc}", style={"color": "#c53030"})
-        return err, err, err
 
 
 # ---------------------------------------------------------------------------
