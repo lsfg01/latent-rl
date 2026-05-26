@@ -55,6 +55,8 @@ class LatentDQNAgent(BaseAgent):
         observation_shape: tuple,
         latent_dim: int = 16,
         encoder_hidden_dims: Optional[list] = None,
+        encoder_dropout: float = 0.0,
+        encoder_activation: str = "relu",
         learning_rate: float = 1e-3,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
@@ -74,6 +76,8 @@ class LatentDQNAgent(BaseAgent):
             observation_shape: Forma de las observaciones
             latent_dim: Dimensión de la representación latente
             encoder_hidden_dims: Dimensiones de capas ocultas del encoder
+            encoder_dropout: Tasa de dropout del encoder (0.0 = sin dropout)
+            encoder_activation: Función de activación del encoder ("relu", "tanh", "gelu")
             learning_rate: Tasa de aprendizaje
             gamma: Factor de descuento
             epsilon_start: Valor inicial de epsilon
@@ -110,8 +114,8 @@ class LatentDQNAgent(BaseAgent):
             input_dim=self.input_dim,
             latent_dim=latent_dim,
             hidden_dims=encoder_hidden_dims,
-            activation="relu",
-            dropout=0.0
+            activation=encoder_activation,
+            dropout=encoder_dropout,
         ).to(self.device)
 
         # Crear red Q latente
