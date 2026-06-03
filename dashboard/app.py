@@ -290,7 +290,7 @@ def _ticker_selector_row():
     en el DOM cuando hay cero o un ticker (para que los callbacks funcionen).
     """
     style = (
-        {"display": "flex"} if len(available_tickers) > 1
+        {"display": "flex"} if len(available_tickers) >= 1
         else {"display": "none"}
     )
     options = [{"label": t, "value": t} for t in available_tickers]
@@ -451,7 +451,31 @@ def create_layout():
             # ── Notas metodologicas ──────────────────────────────────────────
             _section("Notas Metodologicas",
                 html.Div([
-                    html.H3("Limitaciones del experimento"),
+                    html.H3("Glosario de columnas"),
+                    html.Table([
+                        html.Thead(html.Tr([
+                            html.Th("Columna", style={"textAlign": "left", "paddingRight": "24px"}),
+                            html.Th("Descripcion",  style={"textAlign": "left"}),
+                        ])),
+                        html.Tbody([
+                            html.Tr([html.Td(html.Strong("Agente"),                  style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Nombre del agente evaluado (RandomAgent, BuyAndHold, DQNAgent, LatentDQNAgent).")]),
+                            html.Tr([html.Td(html.Strong("Retorno medio IS"),        style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Media del retorno total obtenido durante la fase In-Sample (entrenamiento), promediado sobre todas las semillas.")]),
+                            html.Tr([html.Td(html.Strong("Desv. retorno IS"),        style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Desviacion tipica del retorno IS entre semillas. Mide la variabilidad del agente en entrenamiento.")]),
+                            html.Tr([html.Td(html.Strong("Sharpe IS"),               style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Ratio de Sharpe medio en IS: retorno ajustado por la volatilidad. Valores mas altos indican mejor relacion rentabilidad/riesgo.")]),
+                            html.Tr([html.Td(html.Strong("Max Drawdown IS"),         style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Caida maxima media desde el pico de equity hasta el valle en IS. Valor negativo; cuanto mas proximo a 0, mejor.")]),
+                            html.Tr([html.Td(html.Strong("Equity media IS"),         style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Valor medio del portfolio al final de cada episodio IS (balance inicial + ganancias/perdidas).")]),
+                            html.Tr([html.Td(html.Strong("Retorno medio OOS"),       style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Media del retorno total en la fase Out-of-Sample (datos no vistos durante el entrenamiento).")]),
+                            html.Tr([html.Td(html.Strong("Desv. retorno OOS"),       style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Desviacion tipica del retorno OOS entre semillas.")]),
+                            html.Tr([html.Td(html.Strong("Sharpe OOS"),              style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Ratio de Sharpe medio en OOS. Es el indicador principal de generalizacion del agente.")]),
+                            html.Tr([html.Td(html.Strong("Max Drawdown OOS"),        style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Caida maxima media en OOS. Refleja el riesgo real del agente sobre datos no vistos.")]),
+                            html.Tr([html.Td(html.Strong("Equity media OOS"),        style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Valor medio del portfolio al final de cada episodio OOS.")]),
+                            html.Tr([html.Td(html.Strong("Nº trades medio"),         style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Numero medio de operaciones (compra/venta) realizadas por episodio. Afecta a los costes de transaccion.")]),
+                            html.Tr([html.Td(html.Strong("Desv. entre semillas IS"), style={"paddingRight": "24px", "verticalAlign": "top"}), html.Td("Desviacion tipica del retorno IS calculada entre distintas semillas. Mide la estabilidad del agente ante distintas inicializaciones.")]),
+                        ]),
+                    ], style={"borderCollapse": "collapse", "width": "100%", "marginBottom": "24px",
+                              "fontSize": "13px", "lineHeight": "1.6"}),
+
+                    html.H3("Limitaciones del experimento", style={"marginTop": "8px"}),
                     html.Ul([
                         html.Li("Dashboard exploratorio — no prueba superioridad estadistica."),
                         html.Li("Entrenamiento corto (10 episodios) con datos reales de Yahoo Finance."),
@@ -640,10 +664,25 @@ def update_agent_comparison(data):
         )
 
         # Columnas legibles: excluir columnas muy largas
+        COL_LABELS = {
+            "agent_name":        "Agente",
+            "mean_return_is":    "Retorno medio IS",
+            "std_return_is":     "Desv. retorno IS",
+            "mean_sharpe_is":    "Sharpe IS",
+            "mean_mdd_is":       "Max Drawdown IS",
+            "mean_equity_is":    "Equity media IS",
+            "mean_return_oos":   "Retorno medio OOS",
+            "std_return_oos":    "Desv. retorno OOS",
+            "mean_sharpe_oos":   "Sharpe OOS",
+            "mean_mdd_oos":      "Max Drawdown OOS",
+            "mean_equity_oos":   "Equity media OOS",
+            "mean_n_trades":     "Nº trades medio",
+            "seed_std_return_is":"Desv. entre semillas IS",
+        }
         display_cols = [c for c in summary_df.columns if c not in ("seed",)]
         table = dash_table.DataTable(
             data=summary_records or [],
-            columns=[{"name": c, "id": c} for c in display_cols],
+            columns=[{"name": COL_LABELS.get(c, c), "id": c} for c in display_cols],
             style_table={"overflowX": "auto", "fontSize": "12px"},
             style_header=TABLE_HEADER_STYLE,
             style_cell=TABLE_CELL_STYLE,
