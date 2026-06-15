@@ -1,10 +1,14 @@
-"""Modulo de experimentacion para comparacion de agentes."""
+﻿"""Modulo de experimentacion para comparacion de agentes."""
 
-from .config import ExperimentConfig
+from .config import ExperimentConfig, TickerConfig
 from .utils import (
     load_yfinance_data,
     load_tickers_data,
+    load_ticker_with_config,
     split_data,
+    normalize_is_oos,
+    walk_forward_splits,
+    load_context_features,
     select_action_for_evaluation,
     evaluate_agent,
     aggregate_results,
