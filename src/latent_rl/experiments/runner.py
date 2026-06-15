@@ -1,4 +1,4 @@
-"""
+﻿"""
 Orquestación de experimentos: entrenamiento, ejecución por semilla y pipeline completo.
 
 Todas las funciones aceptan un ExperimentConfig que centraliza los hiperparámetros.
@@ -24,7 +24,10 @@ from latent_rl.evaluation.latent_advantage import LatentAdvantageIndex
 from .config import ExperimentConfig
 from .utils import (
     load_yfinance_data,
+    load_ticker_with_config,
     split_data,
+    normalize_is_oos,
+    walk_forward_splits,
     evaluate_agent,
     aggregate_results,
     print_summary_table,
@@ -395,33 +398,60 @@ def _run_single_ticker(
     print(f"TICKER: {ticker}")
     print(f"{'='*60}")
 
-    # 1. Cargar datos
-    data = load_yfinance_data(
-        ticker=ticker,
-        start=cfg.start_date,
-        end=cfg.end_date,
-        n_obs=cfg.n_obs,
+    # 1. Cargar datos (cache local + features opcionales via TickerConfig)
+    params = cfg.resolve_ticker_params(ticker)
+    print(
+        f"  Periodo: {params['start']} -> {params['end']}  "
+        f"interval={params['interval']}  "
+        f"features={cfg.features if cfg.features else 'OHLCV'}"
     )
-    data_is, data_oos = split_data(data, train_ratio=cfg.train_ratio)
-    print(f"  IS: {len(data_is)} filas  |  OOS: {len(data_oos)} filas")
+    data = load_ticker_with_config(ticker, cfg)
+    n_features = data.shape[1]
 
-    # 2. Experimento multi-semilla
-    all_results = []
-    for seed in cfg.seeds:
-        seed_results = run_single_seed(
-            seed=seed, data_is=data_is, data_oos=data_oos, cfg=cfg
+    # 2. Walk-Forward o split IS/OOS estandar + normalizacion opcional
+    if cfg.wf_enabled:
+        print(
+            f"  Walk-Forward: {cfg.wf_n_windows} ventanas, "
+            f"is_ratio={cfg.wf_is_ratio} | "
+            f"normalizacion={'si' if cfg.normalize_features and cfg.features else 'no'}"
         )
-        all_results.append(seed_results)
-
-        print(f"\nResumen semilla {seed}:")
-        for agent_name, splits in seed_results.items():
-            m_is  = splits["is"]
-            m_oos = splits["oos"]
+        splits_wf = walk_forward_splits(data, cfg.wf_n_windows, cfg.wf_is_ratio)
+        all_results = []
+        for wf_idx, (wf_is, wf_oos) in enumerate(splits_wf):
             print(
-                f"  {agent_name}: "
-                f"IS={m_is['total_return']:.4f} (Sharpe={m_is['sharpe']:.3f}) | "
-                f"OOS={m_oos['total_return']:.4f} (Sharpe={m_oos['sharpe']:.3f})"
+                f"  WF ventana {wf_idx + 1}/{cfg.wf_n_windows}: "
+                f"IS={len(wf_is)} filas  OOS={len(wf_oos)} filas  n_features={n_features}"
             )
+            if cfg.normalize_features and cfg.features:
+                wf_is, wf_oos, _ = normalize_is_oos(wf_is, wf_oos)
+            seed_results = run_single_seed(
+                seed=cfg.seeds[0], data_is=wf_is, data_oos=wf_oos, cfg=cfg
+            )
+            all_results.append(seed_results)
+    else:
+        data_is, data_oos = split_data(data, train_ratio=cfg.train_ratio)
+        print(f"  IS: {len(data_is)} filas  |  OOS: {len(data_oos)} filas  |  n_features: {n_features}")
+
+        if cfg.normalize_features and cfg.features:
+            data_is, data_oos, _ = normalize_is_oos(data_is, data_oos)
+            print("  Normalizacion z-score aplicada (ajuste en IS, sin leakage a OOS).")
+
+        all_results = []
+        for seed in cfg.seeds:
+            seed_results = run_single_seed(
+                seed=seed, data_is=data_is, data_oos=data_oos, cfg=cfg
+            )
+            all_results.append(seed_results)
+
+            print(f"\nResumen semilla {seed}:")
+            for agent_name, splits in seed_results.items():
+                m_is  = splits["is"]
+                m_oos = splits["oos"]
+                print(
+                    f"  {agent_name}: "
+                    f"IS={m_is['total_return']:.4f} (Sharpe={m_is['sharpe']:.3f}) | "
+                    f"OOS={m_oos['total_return']:.4f} (Sharpe={m_oos['sharpe']:.3f})"
+                )
 
     # 3. Agregar y exportar
     aggregated = aggregate_results(all_results)

@@ -17,6 +17,9 @@ import yfinance as yf
 
 from latent_rl.envs import FinancialEnv
 from latent_rl.evaluation.metrics import FinancialMetrics
+from latent_rl.data.cache import DataCache
+from latent_rl.data.features import FeatureEngineer
+from latent_rl.data.normalizer import FeatureNormalizer
 
 
 # ---------------------------------------------------------------------------
@@ -418,3 +421,164 @@ def export_dashboard_results(
     print("\n" + "=" * 120)
     print("RESULTADOS EXPORTADOS CORRECTAMENTE")
     print("=" * 120)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline de datos avanzado (cache, features, normalizacion, walk-forward)
+# ---------------------------------------------------------------------------
+
+def load_ticker_with_config(
+    ticker: str,
+    cfg: "ExperimentConfig",
+) -> pd.DataFrame:
+    """
+    Carga datos OHLCV para un ticker usando DataCache y FeatureEngineer.
+
+    Usa los parametros resueltos del TickerConfig especifico del ticker (si
+    existe), y aplica los features tecnicos configurados en ExperimentConfig.
+
+    Args:
+        ticker: Simbolo del activo.
+        cfg: Configuracion del experimento.
+
+    Returns:
+        DataFrame con columnas [open, high, low, close, volume, *features].
+    """
+    from latent_rl.experiments.config import ExperimentConfig
+    params = cfg.resolve_ticker_params(ticker)
+    cache = DataCache(cfg.cache_dir)
+    df = cache.get_or_download(
+        ticker=ticker,
+        start=params["start"],
+        end=params["end"],
+        interval=params["interval"],
+    )
+    if params["n_obs"] is not None:
+        df = df.tail(params["n_obs"]).reset_index(drop=True)
+
+    if cfg.features:
+        fe = FeatureEngineer()
+        df = fe.transform(df, cfg.features)
+
+    tc = cfg.get_ticker_config(ticker)
+    if tc.context_tickers:
+        ctx = load_context_features(
+            context_tickers=tc.context_tickers,
+            start=params["start"],
+            end=params["end"],
+            n_obs=params["n_obs"],
+            interval=params["interval"],
+            cache_dir=cfg.cache_dir,
+            primary_len=len(df),
+        )
+        df = pd.concat([df.reset_index(drop=True), ctx.reset_index(drop=True)], axis=1)
+
+    return df.reset_index(drop=True)
+
+
+def load_context_features(
+    context_tickers: List[str],
+    start: str,
+    end: str,
+    n_obs: Optional[int],
+    interval: str,
+    cache_dir: str,
+    primary_len: int,
+) -> pd.DataFrame:
+    """
+    Descarga y alinea log_return de los tickers de contexto con el primario.
+
+    Cada ticker de contexto contribuye una columna "ctx_<ticker>_log_return".
+    Si la longitud difiere del primario se recorta o rellena con 0.
+
+    Args:
+        context_tickers: Lista de tickers adicionales.
+        start: Fecha de inicio.
+        end: Fecha de fin.
+        n_obs: Limite de filas (mismo que el primario).
+        interval: Intervalo de velas.
+        cache_dir: Directorio de cache.
+        primary_len: Numero de filas del ticker primario.
+
+    Returns:
+        DataFrame con columnas ctx_<ticker>_log_return alineado al primario.
+    """
+    cache = DataCache(cache_dir)
+    fe = FeatureEngineer()
+    parts: Dict[str, pd.Series] = {}
+
+    for ctx_ticker in context_tickers:
+        try:
+            df_ctx = cache.get_or_download(ctx_ticker, start, end, interval)
+            if n_obs is not None:
+                df_ctx = df_ctx.tail(n_obs).reset_index(drop=True)
+            df_ctx = fe.transform(df_ctx, ["log_return"])
+            lr = df_ctx["log_return"].reset_index(drop=True)
+
+            if len(lr) > primary_len:
+                lr = lr.iloc[-primary_len:].reset_index(drop=True)
+            elif len(lr) < primary_len:
+                pad = pd.Series([0.0] * (primary_len - len(lr)))
+                lr = pd.concat([pad, lr]).reset_index(drop=True)
+
+            parts[f"ctx_{ctx_ticker}_log_return"] = lr
+        except Exception as exc:
+            print(f"  [AVISO] No se pudo cargar contexto '{ctx_ticker}': {exc}")
+
+    return pd.DataFrame(parts)
+
+
+def normalize_is_oos(
+    data_is: pd.DataFrame,
+    data_oos: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, FeatureNormalizer]:
+    """
+    Aplica normalizacion z-score: fit en IS, transform en IS y OOS.
+
+    Las columnas OHLCV se excluyen automaticamente de la normalizacion.
+    No hay data leakage: el OOS nunca ve las estadisticas en fase de fit.
+
+    Args:
+        data_is: Datos In-Sample (se usan para calcular media/std).
+        data_oos: Datos Out-of-Sample (solo se transforma, no se ajusta).
+
+    Returns:
+        Tupla (data_is_norm, data_oos_norm, normalizer).
+    """
+    normalizer = FeatureNormalizer()
+    data_is_norm = normalizer.fit_transform(data_is)
+    data_oos_norm = normalizer.transform(data_oos)
+    return data_is_norm, data_oos_norm, normalizer
+
+
+def walk_forward_splits(
+    data: pd.DataFrame,
+    n_windows: int = 5,
+    is_ratio: float = 0.6,
+) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Genera N ventanas consecutivas de (IS, OOS) para Walk-Forward Analysis.
+
+    Divide los datos totales en n_windows segmentos iguales. En cada ventana,
+    los primeros is_ratio*window_size pasos son IS y el resto OOS.
+
+    Args:
+        data: DataFrame completo con todos los datos.
+        n_windows: Numero de ventanas consecutivas (>= 2).
+        is_ratio: Fraccion IS dentro de cada ventana.
+
+    Returns:
+        Lista de n_windows tuplas (data_is, data_oos).
+    """
+    n = len(data)
+    window_size = n // n_windows
+    splits = []
+    for i in range(n_windows):
+        start_idx = i * window_size
+        end_idx = start_idx + window_size if i < n_windows - 1 else n
+        window = data.iloc[start_idx:end_idx].reset_index(drop=True)
+        is_end = int(len(window) * is_ratio)
+        wf_is = window.iloc[:is_end].reset_index(drop=True)
+        wf_oos = window.iloc[is_end:].reset_index(drop=True)
+        splits.append((wf_is, wf_oos))
+    return splits

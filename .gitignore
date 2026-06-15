@@ -95,3 +95,6 @@ models/
 reports/
 results/
 models/
+
+# Local data cache (pipeline datos, Phase 5)
+.data_cache/
