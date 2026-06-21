@@ -15,8 +15,19 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+_results_dir_override: Optional[Path] = None
+
+
+def set_results_dir(path: str) -> None:
+    """Sobreescribe el directorio de resultados (usado por la CLI del dashboard)."""
+    global _results_dir_override
+    _results_dir_override = Path(path).resolve()
+
+
 def get_results_path() -> Path:
     """Obtiene la ruta al directorio de resultados."""
+    if _results_dir_override is not None:
+        return _results_dir_override
     project_root = Path(__file__).parent.parent.parent
     return project_root / "results"
 

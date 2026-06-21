@@ -4,59 +4,59 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from gymnasium import spaces
 
 from latent_rl.agents.base import BaseAgent
 from latent_rl.agents.replay_buffer import ReplayBuffer
-from latent_rl.representations import MLPLatentEncoder
+from latent_rl.representations.factory import build_encoder
 
 
 class LatentQNetwork(nn.Module):
     """Red neuronal Q que opera sobre representaciones latentes."""
 
     def __init__(self, latent_dim: int, output_dim: int, hidden_dim: int = 128):
-        """
-        Inicializa la red Q latente.
-
-        Args:
-            latent_dim: Dimensión de la representación latente
-            output_dim: Dimensión de salida (número de acciones)
-            hidden_dim: Dimensión de las capas ocultas
-        """
-        super(LatentQNetwork, self).__init__()
-
+        super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass de la red.
-
-        Args:
-            x: Tensor de entrada (batch, latent_dim)
-
-        Returns:
-            Tensor de salida (batch, n_actions)
-        """
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        return self.fc3(x)
 
 
 class LatentDQNAgent(BaseAgent):
-    """Agente DQN con encoder latente para aprendizaje por refuerzo."""
+    """Agente DQN con encoder latente.
+
+    El encoder recibe observaciones de forma (N, L, F) directamente (sin aplanar
+    externamente).  La capa de datos ya normaliza los features; el agente no
+    vuelve a normalizar por defecto (``encoder_internal_norm=False``).
+
+    Parámetros de dos ejes ortogonales del encoder:
+    - ``encoder_type``: "mlp" | "tcn" | "gru"
+    - ``freeze_encoder``: si True, el encoder se congela y el optimizador
+      sólo actualiza la QNetwork.
+    """
 
     def __init__(
         self,
         action_space: spaces.Discrete,
         observation_shape: tuple,
         latent_dim: int = 16,
-        encoder_hidden_dims: Optional[list] = None,
+        encoder_type: str = "mlp",
+        encoder_hidden_dims: Optional[List[int]] = None,
         encoder_dropout: float = 0.0,
         encoder_activation: str = "relu",
+        # TCN kwargs
+        tcn_kernel_size: int = 3,
+        tcn_dilations: Optional[List[int]] = None,
+        tcn_channels: int = 32,
+        # GRU kwargs
+        gru_hidden_dim: int = 64,
+        gru_num_layers: int = 1,
+        # RL hyperparams
         learning_rate: float = 1e-3,
         gamma: float = 0.99,
         epsilon_start: float = 1.0,
@@ -66,28 +66,18 @@ class LatentDQNAgent(BaseAgent):
         buffer_capacity: int = 10000,
         target_update_freq: int = 100,
         q_hidden_dim: int = 128,
-        device: str = "cpu"
+        # Encoder usage
+        freeze_encoder: bool = False,
+        precomputed_latents: bool = False,
+        device: str = "cpu",
     ):
         """
-        Inicializa el agente LatentDQN.
-
         Args:
-            action_space: Espacio de acciones (Discrete)
-            observation_shape: Forma de las observaciones
-            latent_dim: Dimensión de la representación latente
-            encoder_hidden_dims: Dimensiones de capas ocultas del encoder
-            encoder_dropout: Tasa de dropout del encoder (0.0 = sin dropout)
-            encoder_activation: Función de activación del encoder ("relu", "tanh", "gelu")
-            learning_rate: Tasa de aprendizaje
-            gamma: Factor de descuento
-            epsilon_start: Valor inicial de epsilon
-            epsilon_end: Valor final de epsilon
-            epsilon_decay: Factor de decaimiento de epsilon
-            batch_size: Tamaño del batch de entrenamiento
-            buffer_capacity: Capacidad del replay buffer
-            target_update_freq: Frecuencia de actualización de target network
-            q_hidden_dim: Dimensión de las capas ocultas de QNetwork
-            device: Dispositivo de PyTorch ("cpu" o "cuda")
+            precomputed_latents: Si True, el agente espera que las observaciones
+                ya sean vectores latentes de forma (latent_dim,). No construye
+                ni ejecuta encoder. Útil con LatentObservationWrapper para
+                brazos con encoder congelado (C y D): precomputa los latentes
+                una vez fuera del bucle RL.
         """
         super().__init__(action_space)
 
@@ -102,280 +92,247 @@ class LatentDQNAgent(BaseAgent):
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
         self.device = torch.device(device)
+        self.freeze_encoder = freeze_encoder
+        self.precomputed_latents = precomputed_latents
 
-        # Calcular dimensión de entrada (aplanar observación)
-        self.input_dim = int(np.prod(observation_shape))
+        # Dimensiones de la observación (L, F)
+        L, F = observation_shape[0], observation_shape[1] if len(observation_shape) > 1 else 1
+        self.input_dim = int(np.prod(observation_shape))  # backward compat
 
-        # Crear encoder latente
-        if encoder_hidden_dims is None:
-            encoder_hidden_dims = [64, 32]
+        if precomputed_latents:
+            # La observación ya es el vector latente; no se construye encoder.
+            if len(observation_shape) != 1 or observation_shape[0] != latent_dim:
+                raise ValueError(
+                    f"precomputed_latents=True requiere observation_shape=({latent_dim},), "
+                    f"recibido {observation_shape}"
+                )
+            self.encoder = None
+        else:
+            # Construir encoder via factory
+            encoder_kwargs: Dict[str, Any] = {
+                "input_len": L,
+                "n_features": F,
+                "latent_dim": latent_dim,
+                "activation": encoder_activation,
+                "dropout": encoder_dropout,
+            }
+            if encoder_type == "mlp":
+                encoder_kwargs["input_dim"] = self.input_dim
+                if encoder_hidden_dims is not None:
+                    encoder_kwargs["hidden_dims"] = encoder_hidden_dims
+            elif encoder_type == "tcn":
+                encoder_kwargs["kernel_size"] = tcn_kernel_size
+                if tcn_dilations is not None:
+                    encoder_kwargs["dilations"] = tcn_dilations
+                encoder_kwargs["channels"] = tcn_channels
+            elif encoder_type == "gru":
+                encoder_kwargs["hidden_dim"] = gru_hidden_dim
+                encoder_kwargs["num_layers"] = gru_num_layers
 
-        self.encoder = MLPLatentEncoder(
-            input_dim=self.input_dim,
-            latent_dim=latent_dim,
-            hidden_dims=encoder_hidden_dims,
-            activation=encoder_activation,
-            dropout=encoder_dropout,
-        ).to(self.device)
+            self.encoder = build_encoder(encoder_type, **encoder_kwargs).to(self.device)
+            if freeze_encoder:
+                self.encoder.freeze()
 
-        # Crear red Q latente
-        self.q_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(self.device)
-        self.target_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(self.device)
-
-        # Inicializar target network con los mismos pesos
+        # Redes Q (idénticas independientemente del modo)
+        self.q_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(
+            self.device
+        )
+        self.target_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(
+            self.device
+        )
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()
 
-        # Optimizador y loss
-        self.optimizer = optim.Adam(
-            list(self.encoder.parameters()) + list(self.q_network.parameters()),
-            lr=learning_rate
-        )
+        # Optimizador: solo QNetwork si encoder congelado o precomputado
+        if precomputed_latents or freeze_encoder:
+            trainable_params = list(self.q_network.parameters())
+        else:
+            trainable_params = list(self.encoder.parameters()) + list(
+                self.q_network.parameters()
+            )
+        self.optimizer = optim.Adam(trainable_params, lr=learning_rate)
         self.criterion = nn.SmoothL1Loss()
 
-        # Replay buffer
         self.replay_buffer = ReplayBuffer(buffer_capacity, observation_shape)
 
-        # Parámetros de normalización (para encoder preentrenado)
+        # Normalización interna (legado; por defecto no se aplica si la capa
+        # de datos ya normalizó los features)
         self.normalization_mean = None
         self.normalization_std = None
 
-        # Contador de pasos para actualización de target network
         self.update_step = 0
 
+    # ------------------------------------------------------------------
+    # Política
+    # ------------------------------------------------------------------
+
     def select_action(self, observation: np.ndarray, training: bool = True) -> int:
-        """
-        Selecciona una acción usando política epsilon-greedy.
-
-        Args:
-            observation: Observación actual
-            training: Si es True, usa epsilon-greedy; si False, usa greedy
-
-        Returns:
-            Acción seleccionada
-        """
-        # Decaimiento de epsilon durante entrenamiento
         if training:
             self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
-        # Selección epsilon-greedy
         if training and np.random.random() < self.epsilon:
-            # Acción aleatoria
             return self.action_space.sample()
-        else:
-            # Acción greedy
-            with torch.no_grad():
-                obs_normalized = self._normalize_observation(observation)
-                obs_tensor = torch.FloatTensor(obs_normalized).unsqueeze(0).to(self.device)
-                obs_flat = obs_tensor.reshape(obs_tensor.size(0), -1)
-                latent = self.encoder(obs_flat)
-                q_values = self.q_network(latent)
-                return q_values.argmax().item()
 
-    def store_transition(self, state: np.ndarray, action: int, reward: float,
-                       next_state: np.ndarray, done: bool) -> None:
-        """
-        Almacena una transición en el replay buffer.
+        with torch.no_grad():
+            obs = self._normalize_observation(observation)
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            if self.precomputed_latents:
+                # obs ya es el vector latente (latent_dim,); shape (1, latent_dim)
+                latent = obs_t
+            else:
+                latent = self.encoder(obs_t)
+            return self.q_network(latent).argmax().item()
 
-        Args:
-            state: Estado actual
-            action: Acción ejecutada
-            reward: Recompensa obtenida
-            next_state: Estado siguiente
-            done: Si el episodio terminó
-        """
+    def store_transition(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
         self.replay_buffer.add(state, action, reward, next_state, done)
 
     def update(self) -> Dict[str, float]:
-        """
-        Actualiza el encoder y la red Q usando un batch del replay buffer.
-
-        Returns:
-            dict: Métricas de entrenamiento (loss, q_values, etc.)
-        """
-        # Verificar si hay suficientes datos
         if len(self.replay_buffer) < self.batch_size:
             return {"loss": 0.0, "q_mean": 0.0, "q_std": 0.0}
 
-        # Muestrear batch
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(
+            self.batch_size
+        )
 
-        # Aplicar normalización si hay parámetros
         if self.normalization_mean is not None and self.normalization_std is not None:
-            epsilon = 1e-8
-            states = (states - self.normalization_mean) / (self.normalization_std + epsilon)
-            next_states = (next_states - self.normalization_mean) / (self.normalization_std + epsilon)
+            eps = 1e-8
+            states = (states - self.normalization_mean) / (self.normalization_std + eps)
+            next_states = (
+                next_states - self.normalization_mean
+            ) / (self.normalization_std + eps)
 
-        # Convertir a tensores
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
+        states_t = torch.FloatTensor(states).to(self.device)       # (B, L, F) o (B, latent_dim)
+        actions_t = torch.LongTensor(actions).to(self.device)
+        rewards_t = torch.FloatTensor(rewards).to(self.device)
+        next_t = torch.FloatTensor(next_states).to(self.device)
+        dones_t = torch.FloatTensor(dones).to(self.device)
 
-        # Aplanar observaciones
-        states_flat = states.reshape(states.size(0), -1)
-        next_states_flat = next_states.reshape(next_states.size(0), -1)
+        # Latentes
+        if self.precomputed_latents:
+            # Las observaciones ya son vectores latentes; se pasan directamente.
+            latents = states_t
+            next_latents = next_t
+        elif self.freeze_encoder:
+            with torch.no_grad():
+                latents = self.encoder(states_t)
+                next_latents = self.encoder(next_t)
+        else:
+            latents = self.encoder(states_t)
+            next_latents = self.encoder(next_t)
 
-        # Calcular representaciones latentes
-        latents = self.encoder(states_flat)
-        next_latents = self.encoder(next_states_flat)
+        q_values = self.q_network(latents).gather(1, actions_t.unsqueeze(1)).squeeze()
 
-        # Calcular Q-values actuales
-        q_values = self.q_network(latents).gather(1, actions.unsqueeze(1)).squeeze()
-
-        # Calcular Q-values target
         with torch.no_grad():
-            next_q_values = self.target_network(next_latents).max(1)[0]
-            target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+            next_q = self.target_network(next_latents).max(1)[0]
+            target_q = rewards_t + self.gamma * next_q * (1 - dones_t)
 
-        # Calcular loss
-        loss = self.criterion(q_values, target_q_values)
-
-        # Optimizar
+        loss = self.criterion(q_values, target_q)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # Actualizar target network periódicamente
         self.update_step += 1
         if self.update_step % self.target_update_freq == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
 
-        # Calcular métricas
         with torch.no_grad():
-            all_q_values = self.q_network(latents)
-            q_mean = all_q_values.mean().item()
-            q_std = all_q_values.std().item()
-
+            all_q = self.q_network(latents)
         return {
             "loss": loss.item(),
-            "q_mean": q_mean,
-            "q_std": q_std
+            "q_mean": all_q.mean().item(),
+            "q_std": all_q.std().item(),
         }
 
     def reset(self) -> None:
-        """Resetea el estado interno del agente."""
         self.epsilon = self.epsilon_start
         self.update_step = 0
-        # Nota: No reseteamos el replay buffer para acumular experiencia
+
+    # ------------------------------------------------------------------
+    # Persistencia
+    # ------------------------------------------------------------------
 
     def save(self, path: str) -> None:
-        """
-        Guarda el modelo del agente.
-
-        Args:
-            path: Ruta donde guardar el modelo
-        """
-        torch.save({
-            'encoder_state_dict': self.encoder.state_dict(),
-            'q_network_state_dict': self.q_network.state_dict(),
-            'target_network_state_dict': self.target_network.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.epsilon,
-            'update_step': self.update_step
-        }, path)
+        torch.save(
+            {
+                "encoder_state_dict": self.encoder.state_dict() if self.encoder is not None else None,
+                "q_network_state_dict": self.q_network.state_dict(),
+                "target_network_state_dict": self.target_network.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "epsilon": self.epsilon,
+                "update_step": self.update_step,
+            },
+            path,
+        )
 
     def load(self, path: str) -> None:
-        """
-        Carga el modelo del agente.
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        if self.encoder is not None and ckpt.get("encoder_state_dict") is not None:
+            self.encoder.load_state_dict(ckpt["encoder_state_dict"])
+        self.q_network.load_state_dict(ckpt["q_network_state_dict"])
+        self.target_network.load_state_dict(ckpt["target_network_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.epsilon = ckpt["epsilon"]
+        self.update_step = ckpt["update_step"]
 
-        Args:
-            path: Ruta desde donde cargar el modelo
-        """
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
-        self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epsilon = checkpoint['epsilon']
-        self.update_step = checkpoint['update_step']
+    # ------------------------------------------------------------------
+    # Utilidades
+    # ------------------------------------------------------------------
 
     def set_epsilon(self, epsilon: float) -> None:
-        """
-        Establece el valor de epsilon manualmente.
-
-        Args:
-            epsilon: Nuevo valor de epsilon
-        """
         self.epsilon = epsilon
 
     def get_latent_representation(self, observation: np.ndarray) -> np.ndarray:
-        """
-        Obtiene la representación latente de una observación.
-
-        Args:
-            observation: Observación actual
-
-        Returns:
-            Representación latente como array numpy
-        """
         with torch.no_grad():
-            obs_normalized = self._normalize_observation(observation)
-            obs_tensor = torch.FloatTensor(obs_normalized).unsqueeze(0).to(self.device)
-            obs_flat = obs_tensor.reshape(obs_tensor.size(0), -1)
-            latent = self.encoder(obs_flat)
-            return latent.cpu().numpy().squeeze()
+            obs = self._normalize_observation(observation)
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            return self.encoder(obs_t).cpu().numpy().squeeze()
 
     def load_pretrained_encoder(self, path: str) -> None:
-        """
-        Carga pesos de un encoder preentrenado desde un checkpoint.
+        """Carga un encoder preentrenado desde un checkpoint legacy (AutoencoderTrainer)."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
 
-        Args:
-            path: Ruta del checkpoint del encoder preentrenado
-        """
-        # Cargar checkpoint con weights_only=True
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        if "latent_dim" in ckpt:
+            assert ckpt["latent_dim"] == self.latent_dim, (
+                f"Latent dim mismatch: ckpt={ckpt['latent_dim']}, agent={self.latent_dim}"
+            )
+        if "input_dim" in ckpt:
+            assert ckpt["input_dim"] == self.input_dim, (
+                f"Input dim mismatch: ckpt={ckpt['input_dim']}, agent={self.input_dim}"
+            )
 
-        # Verificar compatibilidad de dimensiones
-        if 'latent_dim' in checkpoint:
-            assert checkpoint['latent_dim'] == self.latent_dim, \
-                f"Latent dimension mismatch: checkpoint has {checkpoint['latent_dim']}, agent has {self.latent_dim}"
+        self.encoder.load_state_dict(ckpt["encoder_state_dict"])
 
-        if 'input_dim' in checkpoint:
-            assert checkpoint['input_dim'] == self.input_dim, \
-                f"Input dimension mismatch: checkpoint has {checkpoint['input_dim']}, agent has {self.input_dim}"
+        for key, attr in (("normalization_mean", "normalization_mean"),
+                          ("normalization_std", "normalization_std")):
+            val = ckpt.get(key)
+            if val is not None:
+                if isinstance(val, torch.Tensor):
+                    val = val.cpu().numpy()
+                setattr(self, attr, np.asarray(val, dtype=np.float32))
 
-        # Cargar pesos del encoder
-        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+    def load_artifact_encoder(self, path: str, cfg=None) -> None:
+        """Carga un encoder desde un artefacto v2 (save_encoder_artifact)."""
+        from latent_rl.representations.artifact import load_encoder_artifact
 
-        # Cargar parámetros de normalización si existen
-        if 'normalization_mean' in checkpoint and checkpoint['normalization_mean'] is not None:
-            # Convertir tensor a numpy si es necesario
-            if isinstance(checkpoint['normalization_mean'], torch.Tensor):
-                self.normalization_mean = checkpoint['normalization_mean'].cpu().numpy()
-            else:
-                self.normalization_mean = np.asarray(checkpoint['normalization_mean'], dtype=np.float32)
-
-        if 'normalization_std' in checkpoint and checkpoint['normalization_std'] is not None:
-            # Convertir tensor a numpy si es necesario
-            if isinstance(checkpoint['normalization_std'], torch.Tensor):
-                self.normalization_std = checkpoint['normalization_std'].cpu().numpy()
-            else:
-                self.normalization_std = np.asarray(checkpoint['normalization_std'], dtype=np.float32)
+        encoder, _, _ = load_encoder_artifact(path, cfg=cfg)
+        self.encoder = encoder.to(self.device)
+        if self.freeze_encoder:
+            self.encoder.freeze()
 
     def set_normalization(self, mean: np.ndarray, std: np.ndarray) -> None:
-        """
-        Establece manualmente los parámetros de normalización.
-
-        Args:
-            mean: Array de medias con forma (lookback_window, n_features)
-            std: Array de desviaciones estándar con forma (lookback_window, n_features)
-        """
         self.normalization_mean = mean
         self.normalization_std = std
 
     def _normalize_observation(self, observation: np.ndarray) -> np.ndarray:
-        """
-        Aplica normalización a una observación si hay parámetros de normalización.
-
-        Args:
-            observation: Observación sin normalizar
-
-        Returns:
-            Observación normalizada (o original si no hay parámetros)
-        """
         if self.normalization_mean is not None and self.normalization_std is not None:
-            epsilon = 1e-8
-            return (observation - self.normalization_mean) / (self.normalization_std + epsilon)
+            return (observation - self.normalization_mean) / (
+                self.normalization_std + 1e-8
+            )
         return observation

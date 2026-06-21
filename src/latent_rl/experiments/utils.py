@@ -290,8 +290,9 @@ def aggregate_results(
             "mean_mdd_oos":    float(np.mean(oos_mdds)),
             "mean_equity_oos": float(np.mean(oos_equities)),
             # Cross-sectional
-            "mean_n_trades":       float(np.mean(n_trades_list)),
-            "seed_std_return_is":  float(np.std(is_returns)),
+            "mean_n_trades":          float(np.mean(n_trades_list)),
+            "seed_std_return_is":     float(np.std(is_returns)),
+            "seed_std_sharpe_oos":    float(np.std(oos_sharpes)),
         }
 
     return aggregated
@@ -555,30 +556,73 @@ def walk_forward_splits(
     data: pd.DataFrame,
     n_windows: int = 5,
     is_ratio: float = 0.6,
+    lookback: int = 1,
+    min_oos_steps: int = 1,
 ) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
     """
-    Genera N ventanas consecutivas de (IS, OOS) para Walk-Forward Analysis.
+    Genera N ventanas expansivas (ancladas) de (IS, OOS) para Walk-Forward Analysis.
 
-    Divide los datos totales en n_windows segmentos iguales. En cada ventana,
-    los primeros is_ratio*window_size pasos son IS y el resto OOS.
+    La estrategia es **expansiva/anclada**: el IS siempre comienza en la fila 0
+    y crece en cada ventana, reproduciendo el despliegue real «entrena con todo
+    el pasado, evalúa el periodo siguiente».
+
+    Semántica de ``is_ratio`` (cambiada respecto a la versión anterior):
+        Antes: fracción IS dentro de cada bloque disjunto e igual.
+        Ahora: **fracción inicial de anclaje** — ``anchor_end = floor(n * is_ratio)``
+        es el fin del IS de la primera ventana. El tramo restante se divide en
+        ``n_windows`` bloques OOS contiguos e iguales.
+
+    Ventana k (k = 0 … K−1):
+        IS  = data[0 : oos_start]   (crece con k)
+        OOS = data[oos_start : oos_end]  (contiguo, sin solapamiento)
 
     Args:
         data: DataFrame completo con todos los datos.
-        n_windows: Numero de ventanas consecutivas (>= 2).
-        is_ratio: Fraccion IS dentro de cada ventana.
+        n_windows: Número de ventanas (≥ 2).
+        is_ratio: Fracción inicial de anclaje. La primera ventana tiene un IS
+            de ``floor(n * is_ratio)`` filas; las siguientes lo heredan y amplían.
+        lookback: Tamaño de ventana de observación del entorno (para validar que
+            IS y OOS tienen filas suficientes). Por defecto 1.
+        min_oos_steps: Mínimo de filas OOS evaluables por encima del lookback.
 
     Returns:
-        Lista de n_windows tuplas (data_is, data_oos).
+        Lista de ``n_windows`` tuplas ``(data_is, data_oos)`` con índice reseteado.
+
+    Raises:
+        ValueError: Si ``n_windows < 2``, o si el ancla o los bloques OOS son
+            demasiado cortos dados ``lookback`` y ``min_oos_steps``.
     """
     n = len(data)
-    window_size = n // n_windows
-    splits = []
-    for i in range(n_windows):
-        start_idx = i * window_size
-        end_idx = start_idx + window_size if i < n_windows - 1 else n
-        window = data.iloc[start_idx:end_idx].reset_index(drop=True)
-        is_end = int(len(window) * is_ratio)
-        wf_is = window.iloc[:is_end].reset_index(drop=True)
-        wf_oos = window.iloc[is_end:].reset_index(drop=True)
+    K = n_windows
+
+    if K < 2:
+        raise ValueError(f"n_windows debe ser >= 2, got {K}")
+
+    anchor_end = int(n * is_ratio)
+    min_is_rows = lookback + 1
+    if anchor_end < min_is_rows:
+        raise ValueError(
+            f"walk_forward_splits: is_ratio={is_ratio} deja anchor_end={anchor_end} filas, "
+            f"pero se necesitan al menos {min_is_rows} (lookback={lookback}+1) para el IS inicial. "
+            f"Aumenta is_ratio o usa más datos."
+        )
+
+    remaining = n - anchor_end
+    b = remaining // K
+    min_oos_rows = lookback + min_oos_steps
+    if b < min_oos_rows:
+        raise ValueError(
+            f"walk_forward_splits: bloque OOS de {b} filas es menor que el mínimo requerido "
+            f"{min_oos_rows} (lookback={lookback} + min_oos_steps={min_oos_steps}). "
+            f"Reduce n_windows, aumenta is_ratio, o usa más datos."
+        )
+
+    splits: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
+    for k in range(K):
+        oos_start = anchor_end + k * b
+        oos_end   = anchor_end + (k + 1) * b if k < K - 1 else n
+        wf_is  = data.iloc[0:oos_start].reset_index(drop=True)
+        wf_oos = data.iloc[oos_start:oos_end].reset_index(drop=True)
         splits.append((wf_is, wf_oos))
+
     return splits

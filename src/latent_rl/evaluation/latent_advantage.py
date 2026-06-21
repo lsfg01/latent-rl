@@ -1,186 +1,163 @@
 """
-Índice de Ventaja Latente (IVL)
+Índice de Ventaja Latente (IVL) — v2
 
-El IVL es una métrica agregada que compara el rendimiento de un agente
-que utiliza representaciones latentes frente a un agente directo.
+Fórmula:
+    IVL = w1·ΔSharpe - w2·ΔMDD - w3·Δσ_seeds - w4·ΔGap
 
-IVL = w1 * delta_sharpe - w2 * delta_mdd - w3 * delta_seed_std - w4 * delta_is_oos_gap
+Componentes (todas sobre métricas acotadas y OOS):
 
-donde:
-- delta_sharpe    = sharpe_latent - sharpe_direct           (mayor es mejor → positivo = ventaja latente)
-- delta_mdd       = |mdd_latent| - |mdd_direct|             (MAGNITUD del drawdown, valor positivo)
-- delta_seed_std  = seed_std_latent - seed_std_direct        (menor std es mejor → negativo = ventaja latente)
-- delta_is_oos_gap = |perf_is_latent - perf_oos_latent| - |perf_is_direct - perf_oos_direct|
+    ΔSharpe   = Sharpe_OOS(latente) − Sharpe_OOS(directo)
+    ΔMDD      = |MDD_OOS(latente)|  − |MDD_OOS(directo)|   (magnitud)
+    Δσ_seeds  = σ_seeds(Sharpe_OOS)(latente) − σ_seeds(Sharpe_OOS)(directo)
+    ΔGap      = gap(latente) − gap(directo),  gap = |Sharpe_IS − Sharpe_OOS|
 
-Convención de max_drawdown:
-    El campo "max_drawdown" en las métricas debe ser la MAGNITUD del drawdown
-    (valor positivo, ej: 0.25 para una caída máxima del 25%).
-    Si se usa FinancialMetrics.max_drawdown(), que devuelve un valor negativo,
-    hay que pasar abs(max_drawdown) antes de construir el diccionario de métricas.
-    El IVL aplica abs() internamente para tolerar ambas convenciones.
+Signos: mayor Sharpe OOS del latente suma; menor drawdown, menor varianza entre
+semillas y menor brecha IS/OOS del latente suman (van restando).
+
+Pesos por defecto: w = [0.35, 0.25, 0.20, 0.20].
+
+Normalización (Cambio 2):
+    Antes de ponderar, cada Δ se divide por su escala (std agrupado sobre todas las
+    comparaciones del experimento). Si la escala < 1e-8, la componente se fija a 0.
+    La normalización se aplica pasando ``scales`` a ``compute()``. Sin ``scales``,
+    el IVL usa los deltas crudos (útil para comparaciones aisladas o tests).
+
+Métricas requeridas en el dict de entrada:
+    - sharpe_oos          : Sharpe OOS medio entre semillas
+    - mdd_oos             : MDD OOS medio (negativo o positivo; se aplica abs())
+    - seed_std_sharpe_oos : desviación típica del Sharpe OOS entre semillas
+    - sharpe_is           : Sharpe IS medio (solo para calcular la brecha)
 """
 
 from typing import Dict, Optional
 
 
 class LatentAdvantageIndex:
-    """
-    Calcula el Índice de Ventaja Latente (IVL).
+    """Calcula el Índice de Ventaja Latente (IVL) con métricas acotadas y OOS."""
 
-    El IVL es una métrica agregada que mide la ventaja de utilizar
-    representaciones latentes frente a un enfoque directo.
-
-    Un IVL positivo indica ventaja latente, negativo indica ventaja directa,
-    y valores cercanos a cero indican neutralidad.
-
-    Attributes:
-        weights: Diccionario con pesos para cada componente del IVL.
-        neutral_threshold: Umbral para considerar el IVL como neutral.
-    """
+    DEFAULT_WEIGHTS: Dict[str, float] = {
+        "sharpe":     0.35,
+        "mdd":        0.25,
+        "seed_std":   0.20,
+        "is_oos_gap": 0.20,
+    }
 
     def __init__(
         self,
         weights: Optional[Dict[str, float]] = None,
-        neutral_threshold: float = 1e-6
+        neutral_threshold: float = 1e-6,
     ):
         """
-        Inicializa el calculador del IVL.
-
         Args:
-            weights: Diccionario con pesos para cada componente.
-                     Por defecto: {"sharpe": 0.25, "mdd": 0.25, "seed_std": 0.25, "is_oos_gap": 0.25}
-            neutral_threshold: Umbral para considerar el IVL como neutral.
-
-        Raises:
-            ValueError: Si los pesos son inválidos (negativos o no suman 1).
+            weights: Pesos de las cuatro componentes. Si None usa DEFAULT_WEIGHTS.
+            neutral_threshold: Umbral ±ε para interpretar IVL como neutral.
         """
         if weights is None:
-            weights = {
-                "sharpe": 0.25,
-                "mdd": 0.25,
-                "seed_std": 0.25,
-                "is_oos_gap": 0.25
-            }
+            weights = dict(self.DEFAULT_WEIGHTS)
 
         self._validate_weights(weights)
         self.weights = weights
         self.neutral_threshold = neutral_threshold
 
+    # ------------------------------------------------------------------
+    # Validación
+    # ------------------------------------------------------------------
+
     def _validate_weights(self, weights: Dict[str, float]) -> None:
-        """
-        Valida que los pesos sean correctos.
-
-        Args:
-            weights: Diccionario con pesos a validar.
-
-        Raises:
-            ValueError: Si algún peso es negativo o si no suman 1.
-        """
-        # Verificar que todos los pesos sean >= 0
         for key, value in weights.items():
             if value < 0:
                 raise ValueError(f"El peso '{key}' es negativo: {value}")
-
-        # Verificar que sumen 1 (con tolerancia)
         total = sum(weights.values())
-        tolerance = 1e-6
-
-        if abs(total - 1.0) > tolerance:
+        if abs(total - 1.0) > 1e-6:
             raise ValueError(
                 f"Los pesos deben sumar 1.0, pero suman {total:.6f}"
             )
 
     def _validate_metrics(self, metrics: Dict[str, float], name: str) -> None:
-        """
-        Valida que las métricas requeridas estén presentes.
-
-        Args:
-            metrics: Diccionario con métricas a validar.
-            name: Nombre del conjunto de métricas (para mensajes de error).
-
-        Raises:
-            ValueError: Si falta alguna métrica requerida.
-        """
-        required_metrics = ["sharpe", "max_drawdown", "seed_std", "perf_is", "perf_oos"]
-
-        missing = [m for m in required_metrics if m not in metrics]
-
+        required = ["sharpe_oos", "mdd_oos", "seed_std_sharpe_oos", "sharpe_is"]
+        missing = [k for k in required if k not in metrics]
         if missing:
             raise ValueError(
                 f"Faltan métricas requeridas en {name}: {missing}"
             )
 
+    # ------------------------------------------------------------------
+    # Cálculo
+    # ------------------------------------------------------------------
+
     def compute(
         self,
         direct_metrics: Dict[str, float],
-        latent_metrics: Dict[str, float]
+        latent_metrics: Dict[str, float],
+        scales: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """
-        Calcula el Índice de Ventaja Latente.
+        Calcula el IVL.
 
         Args:
             direct_metrics: Métricas del agente directo.
             latent_metrics: Métricas del agente latente.
+            scales: Escalas de normalización por componente (std agrupado a nivel
+                experimento). Si None, el IVL se calcula sobre los deltas crudos.
 
         Returns:
             Diccionario con:
-                - ivl: Valor del IVL
-                - delta_sharpe: Diferencia de Sharpe
-                - delta_mdd: Diferencia de Max Drawdown
-                - delta_seed_std: Diferencia de desviación entre semillas
-                - delta_is_oos_gap: Diferencia de gap IS/OOS
-                - interpretation: Interpretación del resultado
-
-        Raises:
-            ValueError: Si faltan métricas requeridas.
+                ivl, interpretation,
+                delta_sharpe / _mdd / _seed_std / _is_oos_gap  (crudos),
+                delta_sharpe_norm / _mdd_norm / _seed_std_norm / _is_oos_gap_norm
+                    (normalizados; iguales a crudos si scales=None).
         """
-        # Validar métricas
         self._validate_metrics(direct_metrics, "direct_metrics")
         self._validate_metrics(latent_metrics, "latent_metrics")
 
-        # Calcular deltas
-        delta_sharpe = latent_metrics["sharpe"] - direct_metrics["sharpe"]
-        # abs() para tolerar tanto valores positivos (magnitud) como negativos (convención de FinancialMetrics)
-        delta_mdd = abs(latent_metrics["max_drawdown"]) - abs(direct_metrics["max_drawdown"])
-        delta_seed_std = latent_metrics["seed_std"] - direct_metrics["seed_std"]
+        # Deltas crudos
+        delta_sharpe   = latent_metrics["sharpe_oos"]           - direct_metrics["sharpe_oos"]
+        delta_mdd      = abs(latent_metrics["mdd_oos"])         - abs(direct_metrics["mdd_oos"])
+        delta_seed_std = latent_metrics["seed_std_sharpe_oos"]  - direct_metrics["seed_std_sharpe_oos"]
+        gap_l = abs(latent_metrics["sharpe_is"] - latent_metrics["sharpe_oos"])
+        gap_d = abs(direct_metrics["sharpe_is"] - direct_metrics["sharpe_oos"])
+        delta_is_oos_gap = gap_l - gap_d
 
-        # Calcular delta_is_oos_gap
-        gap_latent = abs(latent_metrics["perf_is"] - latent_metrics["perf_oos"])
-        gap_direct = abs(direct_metrics["perf_is"] - direct_metrics["perf_oos"])
-        delta_is_oos_gap = gap_latent - gap_direct
+        raw = {
+            "delta_sharpe":     delta_sharpe,
+            "delta_mdd":        delta_mdd,
+            "delta_seed_std":   delta_seed_std,
+            "delta_is_oos_gap": delta_is_oos_gap,
+        }
 
-        # Calcular IVL
+        # Normalización
+        if scales is not None:
+            def _norm(key: str, val: float) -> float:
+                s = scales.get(key, 0.0)
+                return val / s if s > 1e-8 else 0.0
+            normalized = {k: _norm(k, v) for k, v in raw.items()}
+        else:
+            normalized = dict(raw)
+
+        # IVL ponderado sobre componentes normalizadas (o crudas si sin scales)
         ivl = (
-            self.weights["sharpe"] * delta_sharpe
-            - self.weights["mdd"] * delta_mdd
-            - self.weights["seed_std"] * delta_seed_std
-            - self.weights["is_oos_gap"] * delta_is_oos_gap
+            self.weights["sharpe"]      * normalized["delta_sharpe"]
+            - self.weights["mdd"]       * normalized["delta_mdd"]
+            - self.weights["seed_std"]  * normalized["delta_seed_std"]
+            - self.weights["is_oos_gap"]* normalized["delta_is_oos_gap"]
         )
 
-        # Interpretar resultado
-        interpretation = self.interpret(ivl)
-
         return {
-            "ivl": ivl,
-            "delta_sharpe": delta_sharpe,
-            "delta_mdd": delta_mdd,
-            "delta_seed_std": delta_seed_std,
-            "delta_is_oos_gap": delta_is_oos_gap,
-            "interpretation": interpretation
+            "ivl":               ivl,
+            "interpretation":    self.interpret(ivl),
+            # Componentes crudas
+            "delta_sharpe":      delta_sharpe,
+            "delta_mdd":         delta_mdd,
+            "delta_seed_std":    delta_seed_std,
+            "delta_is_oos_gap":  delta_is_oos_gap,
+            # Componentes normalizadas
+            "delta_sharpe_norm":     normalized["delta_sharpe"],
+            "delta_mdd_norm":        normalized["delta_mdd"],
+            "delta_seed_std_norm":   normalized["delta_seed_std"],
+            "delta_is_oos_gap_norm": normalized["delta_is_oos_gap"],
         }
 
     def interpret(self, ivl: float) -> str:
-        """
-        Interpreta el valor del IVL.
-
-        Args:
-            ivl: Valor del IVL a interpretar.
-
-        Returns:
-            "latent_advantage" si ivl > neutral_threshold
-            "neutral" si abs(ivl) <= neutral_threshold
-            "direct_advantage" si ivl < -neutral_threshold
-        """
         if ivl > self.neutral_threshold:
             return "latent_advantage"
         elif ivl < -self.neutral_threshold:

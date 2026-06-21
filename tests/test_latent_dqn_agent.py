@@ -356,6 +356,67 @@ class TestLatentDQNAgent:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
+    def test_encoder_type_tcn_no_error(self, env):
+        """LatentDQNAgent debe aceptar encoder_type='tcn' sin error."""
+        agent = LatentDQNAgent(
+            action_space=env.action_space,
+            observation_shape=env.observation_space.shape,
+            latent_dim=8,
+            encoder_type="tcn",
+        )
+        obs, _ = env.reset()
+        action = agent.select_action(obs, training=False)
+        assert env.action_space.contains(action)
+
+    def test_freeze_encoder_weights_unchanged(self, env):
+        """Con freeze_encoder=True, los pesos del encoder no cambian al hacer update()."""
+        obs_shape = env.observation_space.shape
+        agent = LatentDQNAgent(
+            action_space=env.action_space,
+            observation_shape=obs_shape,
+            latent_dim=8,
+            freeze_encoder=True,
+            batch_size=16,
+            buffer_capacity=500,
+        )
+
+        # Guardar pesos iniciales del encoder
+        weights_before = {
+            k: v.clone() for k, v in agent.encoder.state_dict().items()
+        }
+
+        # Añadir transiciones y actualizar
+        for _ in range(50):
+            state = np.random.randn(*obs_shape).astype(np.float32)
+            next_state = np.random.randn(*obs_shape).astype(np.float32)
+            agent.store_transition(state, 0, 0.0, next_state, False)
+
+        for _ in range(5):
+            agent.update()
+
+        # Los pesos del encoder deben ser idénticos
+        for k, v in agent.encoder.state_dict().items():
+            assert torch.allclose(weights_before[k], v), \
+                f"El peso {k} del encoder cambió con freeze_encoder=True"
+
+    def test_freeze_encoder_optimizer_has_no_encoder_params(self, env):
+        """Con freeze_encoder=True, el optimizador sólo contiene parámetros de Q-network."""
+        agent = LatentDQNAgent(
+            action_space=env.action_space,
+            observation_shape=env.observation_space.shape,
+            latent_dim=8,
+            freeze_encoder=True,
+        )
+
+        # Recopilar IDs de parámetros del encoder
+        encoder_param_ids = {id(p) for p in agent.encoder.parameters()}
+
+        # Comprobar que ningún grupo de parámetros del optimizador incluye encoder params
+        for group in agent.optimizer.param_groups:
+            for p in group["params"]:
+                assert id(p) not in encoder_param_ids, \
+                    "El optimizador contiene parámetros del encoder en modo freeze"
+
     def test_set_normalization(self, agent):
         """Test de set_normalization."""
         lookback_window = 10

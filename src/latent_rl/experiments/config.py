@@ -74,6 +74,12 @@ class ExperimentConfig:
     Agrupa todos los parametros ajustables del pipeline en un unico objeto
     con valores por defecto reproducibles. El objeto se valida al crearse.
 
+    Brazos experimentales (``run_arms``):
+      A = DQNAgent directo
+      B = LatentDQNAgent  (encoder random, finetune)
+      C = LatentDQNAgent  (encoder ligero IS, frozen)
+      D = LatentDQNAgent  (encoder heavy offline, frozen) — requiere heavy_encoder_path
+
     Attributes:
         tickers: Lista de simbolos de activos a descargar de Yahoo Finance.
         ticker_configs: Configuraciones por ticker (sobrescriben valores globales).
@@ -84,13 +90,16 @@ class ExperimentConfig:
         interval: Intervalo de velas para la descarga ("1d", "1wk", "1h").
         cache_dir: Directorio de cache local para datos descargados.
         features: Features tecnicos a anadir tras OHLCV.
-                  Disponibles: log_return, high_low_range, close_open_pct,
-                               volume_ratio, rsi_14, atr_pct, market_regime, ma_ratio.
         normalize_features: Si True, aplica z-score (fit en IS, sin leakage a OOS).
 
         wf_enabled: Activa Walk-Forward Analysis en lugar del split simple IS/OOS.
         wf_n_windows: Numero de ventanas WF consecutivas (>= 2).
-        wf_is_ratio: Fraccion IS dentro de cada ventana WF (0 < ratio < 1).
+        wf_is_ratio: Fracción inicial de anclaje. La primera ventana IS abarca
+            ``floor(n * wf_is_ratio)`` filas desde el inicio; las ventanas
+            siguientes heredan ese ancla y la amplían. Diferente a la semántica
+            anterior (fracción IS dentro de cada bloque disjunto).
+        wf_mode: Estrategia de ventana. "expanding" (anclada, por defecto) o
+            "sliding" (reservado para implementación futura).
 
         seeds: Semillas aleatorias para la inicializacion de agentes.
         n_training_episodes: Episodios de entrenamiento RL por agente y semilla.
@@ -100,6 +109,17 @@ class ExperimentConfig:
         lookback_window: Ventana de observacion historica de FinancialEnv.
         initial_balance: Capital inicial del entorno de trading (USD).
         transaction_cost: Coste de transaccion como fraccion del valor operado.
+
+        run_arms: Brazos a ejecutar. Subconjunto de ["A", "B", "C", "D"].
+        encoder_type: Tipo de encoder para brazos B/C/D ("tcn", "mlp", "gru").
+        heavy_encoder_path: Ruta al artefacto del encoder gordo (brazo D).
+        tcn_kernel_size: Tamaño del kernel TCN.
+        tcn_dilations: Dilataciones TCN.
+        tcn_channels: Canales TCN.
+        gru_hidden_dim: Dimensión oculta GRU.
+        gru_num_layers: Número de capas GRU.
+        pretrain_lambda_forecast: Peso del objetivo de forecasting en el pretrainer.
+        pretrain_k_forecast: Horizonte de forecasting en el pretrainer.
 
         device: Dispositivo PyTorch ("cpu" o "cuda").
         results_dir: Directorio donde se guardan los CSVs de resultados.
@@ -121,6 +141,7 @@ class ExperimentConfig:
     wf_enabled:   bool  = False
     wf_n_windows: int   = 5
     wf_is_ratio:  float = 0.6
+    wf_mode:      str   = "expanding"  # "expanding" | "sliding" (futuro)
 
     # -- Experimento ----------------------------------------------------------
     seeds:                 List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
@@ -159,23 +180,32 @@ class ExperimentConfig:
     latent_epsilon_end:      float      = 0.1
     latent_epsilon_decay:    float      = 0.995
 
-    # -- Preentrenamiento -----------------------------------------------------
-    pretrain_n_samples:  int   = 100
-    pretrain_n_epochs:   int   = 10
-    pretrain_lr:         float = 1e-3
-    pretrain_batch_size: int   = 32
+    # -- Brazos experimentales ------------------------------------------------
+    run_arms:             List[str]      = field(default_factory=lambda: ["A", "B", "C", "D"])
+    encoder_type:         str            = "tcn"
+    heavy_encoder_path:   Optional[str]  = None
+    tcn_kernel_size:      int            = 3
+    tcn_dilations:        List[int]      = field(default_factory=lambda: [1, 2, 4])
+    tcn_channels:         int            = 32
+    gru_hidden_dim:       int            = 64
+    gru_num_layers:       int            = 1
+
+    # -- Preentrenamiento (brazo C y offline) ---------------------------------
+    pretrain_n_samples:       int   = 100   # legado AutoencoderTrainer
+    pretrain_n_epochs:        int   = 10
+    pretrain_lr:              float = 1e-3
+    pretrain_batch_size:      int   = 32
+    pretrain_lambda_forecast: float = 0.5
+    pretrain_k_forecast:      int   = 5
 
     # -- IVL ------------------------------------------------------------------
-    direct_agent:  str       = "DQNAgent"
-    latent_agents: List[str] = field(default_factory=lambda: [
-        "LatentDQNAgent (no pretrained)",
-        "LatentDQNAgent (pretrained)",
-    ])
+    direct_agent:  str       = "A"
+    latent_agents: List[str] = field(default_factory=lambda: ["B", "C", "D"])
     ivl_weights: Dict[str, float] = field(default_factory=lambda: {
-        "sharpe":     0.25,
+        "sharpe":     0.35,
         "mdd":        0.25,
-        "seed_std":   0.25,
-        "is_oos_gap": 0.25,
+        "seed_std":   0.20,
+        "is_oos_gap": 0.20,
     })
 
     # -- Sistema --------------------------------------------------------------
@@ -200,6 +230,24 @@ class ExperimentConfig:
             "n_obs":    tc.n_obs      if tc.n_obs is not None else self.n_obs,
             "interval": tc.interval   or self.interval,
         }
+
+    def encoder_kwargs(self) -> dict:
+        """Devuelve kwargs de arquitectura para build_encoder según encoder_type."""
+        base = {
+            "latent_dim": self.latent_dim,
+            "activation": self.encoder_activation,
+            "dropout": self.encoder_dropout,
+        }
+        if self.encoder_type == "mlp":
+            base["hidden_dims"] = self.encoder_hidden_dims
+        elif self.encoder_type == "tcn":
+            base["kernel_size"] = self.tcn_kernel_size
+            base["dilations"] = self.tcn_dilations
+            base["channels"] = self.tcn_channels
+        elif self.encoder_type == "gru":
+            base["hidden_dim"] = self.gru_hidden_dim
+            base["num_layers"] = self.gru_num_layers
+        return base
 
     def __post_init__(self) -> None:
         """Valida los valores de configuracion al construir el objeto."""
@@ -271,3 +319,11 @@ class ExperimentConfig:
                 raise ValueError(
                     f"wf_is_ratio debe estar en (0, 1), got {self.wf_is_ratio}"
                 )
+
+        valid_arms = {"A", "B", "C", "D"}
+        unknown_arms = set(self.run_arms) - valid_arms
+        if unknown_arms:
+            raise ValueError(
+                f"run_arms contiene brazos desconocidos: {unknown_arms}. "
+                f"Válidos: {valid_arms}"
+            )

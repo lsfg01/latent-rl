@@ -3,23 +3,17 @@
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Dict
 
 
 class LatentEncoder(nn.Module, ABC):
     """Encoder latente abstracto para representaciones de mercado."""
 
     def __init__(self, input_dim: int, latent_dim: int):
-        """
-        Inicializa el encoder latente.
-
-        Args:
-            input_dim: Dimensión de entrada
-            latent_dim: Dimensión de la representación latente
-        """
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
+        self.is_frozen = False
 
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -27,10 +21,10 @@ class LatentEncoder(nn.Module, ABC):
         Codifica la entrada a representación latente.
 
         Args:
-            x: Tensor de entrada de forma (batch_size, input_dim)
+            x: Tensor de forma (N, L, F) o (N, input_dim)
 
         Returns:
-            Tensor latente de forma (batch_size, latent_dim)
+            Tensor latente de forma (N, latent_dim)
         """
         pass
 
@@ -40,35 +34,40 @@ class LatentEncoder(nn.Module, ABC):
         Decodifica la representación latente.
 
         Args:
-            z: Tensor latente de forma (batch_size, latent_dim)
+            z: Tensor latente de forma (N, latent_dim)
 
         Returns:
-            Tensor reconstruido de forma (batch_size, input_dim)
+            Tensor reconstruido
         """
         pass
 
+    @abstractmethod
+    def get_arch_config(self) -> Dict:
+        """Devuelve la configuración de arquitectura para el sistema de artefactos."""
+        pass
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Alias para el método forward.
-
-        Args:
-            x: Tensor de entrada
-
-        Returns:
-            Tensor latente
-        """
+        """Alias para forward."""
         return self.forward(x)
 
     def reconstruction_loss(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Calcula la pérdida de reconstrucción.
-
-        Args:
-            x: Tensor de entrada
-
-        Returns:
-            Pérdida de reconstrucción (MSE)
-        """
+        """Calcula la pérdida de reconstrucción (MSE)."""
         z = self.encode(x)
         x_reconstructed = self.decode(z)
+        if x_reconstructed.shape != x.shape:
+            x_flat = x.reshape(x.size(0), -1)
+            x_recon_flat = x_reconstructed.reshape(x_reconstructed.size(0), -1)
+            return nn.functional.mse_loss(x_recon_flat, x_flat)
         return nn.functional.mse_loss(x_reconstructed, x)
+
+    def freeze(self) -> None:
+        """Congela todos los parámetros del módulo."""
+        for param in self.parameters():
+            param.requires_grad = False
+        self.is_frozen = True
+
+    def unfreeze(self) -> None:
+        """Descongela todos los parámetros del módulo."""
+        for param in self.parameters():
+            param.requires_grad = True
+        self.is_frozen = False

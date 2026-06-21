@@ -1,23 +1,31 @@
-﻿"""
+"""
 Orquestación de experimentos: entrenamiento, ejecución por semilla y pipeline completo.
 
 Todas las funciones aceptan un ExperimentConfig que centraliza los hiperparámetros.
 Soporta uno o varios tickers: cada ticker ejecuta el pipeline de forma independiente
 y los resultados se agregan en un resumen cross-ticker.
+
+Brazos experimentales:
+  A  DQNAgent directo
+  B  LatentDQNAgent (encoder random, finetune)
+  C  LatentDQNAgent (encoder ligero pretrained en IS, frozen)
+  D  LatentDQNAgent (encoder heavy offline, frozen) — requiere cfg.heavy_encoder_path
 """
 
 from __future__ import annotations
 
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import torch
 
-from latent_rl.envs import FinancialEnv
+from latent_rl.envs import FinancialEnv, LatentObservationWrapper, precompute_latent_series
 from latent_rl.agents import DQNAgent, LatentDQNAgent, RandomAgent, BuyAndHoldAgent
-from latent_rl.representations import MLPLatentEncoder
+from latent_rl.representations import MLPLatentEncoder, build_encoder
 from latent_rl.pretraining import AutoencoderTrainer
 from latent_rl.evaluation.latent_advantage import LatentAdvantageIndex
 
@@ -37,7 +45,201 @@ from .utils import (
 
 
 # ---------------------------------------------------------------------------
-# Entrenamiento de agentes
+# Contexto de encoders congelados (precomputación)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FrozenEncoderContext:
+    """Latentes precomputados para los brazos C y D.
+
+    Calculado una vez por ticker/split, reutilizado en cada semilla.
+    Para encoders congelados, latente(encoder(obs)) es idéntico en cada
+    iteración, por lo que precomputarlo no altera los resultados numéricos.
+    """
+    c_encoder: Optional[Any]
+    c_latents_is: Optional[np.ndarray]    # (T_is, latent_dim)
+    c_latents_oos: Optional[np.ndarray]   # (T_oos, latent_dim)
+    d_encoder: Optional[Any]
+    d_latents_is: Optional[np.ndarray]    # (T_is, latent_dim)
+    d_latents_oos: Optional[np.ndarray]   # (T_oos, latent_dim)
+
+
+def prepare_arm_c_encoder(
+    data_is: pd.DataFrame,
+    cfg: ExperimentConfig,
+) -> Optional[Any]:
+    """Entrena el encoder ligero del brazo C sobre IS una única vez.
+
+    Returns:
+        Encoder entrenado y congelado, o None si no hay features/log_return.
+    """
+    from latent_rl.pretraining.encoder_pretrainer import EncoderPretrainer
+
+    features = list(cfg.features) if cfg.features else []
+    if not features or "log_return" not in features:
+        return None
+
+    L = cfg.lookback_window
+    F = len(features)
+    encoder = build_encoder(
+        cfg.encoder_type,
+        input_len=L,
+        n_features=F,
+        **cfg.encoder_kwargs(),
+    )
+    pretrainer = EncoderPretrainer(
+        encoder=encoder,
+        learning_rate=cfg.pretrain_lr,
+        batch_size=cfg.pretrain_batch_size,
+        lambda_forecast=cfg.pretrain_lambda_forecast,
+        k=cfg.pretrain_k_forecast,
+        device=cfg.device,
+    )
+    X, Y = pretrainer.make_windows(data_is, features, L)
+    if len(X) > 0:
+        pretrainer.train(
+            X=X, Y=Y,
+            n_epochs=cfg.pretrain_n_epochs,
+            val_ratio=0.1,
+            early_stopping_patience=5,
+        )
+    encoder.freeze()
+    encoder.eval()
+    return encoder
+
+
+def _build_frozen_ctx(
+    data_is: pd.DataFrame,
+    data_oos: pd.DataFrame,
+    cfg: ExperimentConfig,
+    d_encoder: Optional[Any],
+) -> FrozenEncoderContext:
+    """Precomputa latentes para C y D antes del bucle de semillas."""
+    features = list(cfg.features) if cfg.features else []
+    device = torch.device(cfg.device)
+    L = cfg.lookback_window
+
+    c_encoder = c_latents_is = c_latents_oos = None
+    d_latents_is = d_latents_oos = None
+
+    if "C" in cfg.run_arms and features:
+        print("  [ctx] Entrenando encoder ligero (brazo C)...")
+        c_encoder = prepare_arm_c_encoder(data_is, cfg)
+        if c_encoder is not None:
+            c_encoder = c_encoder.to(device)
+            print("  [ctx] Precomputando latentes C (IS + OOS)...")
+            c_latents_is  = precompute_latent_series(data_is,  L, features, c_encoder, device)
+            c_latents_oos = precompute_latent_series(data_oos, L, features, c_encoder, device)
+
+    if "D" in cfg.run_arms and d_encoder is not None and features:
+        print("  [ctx] Precomputando latentes D (IS + OOS)...")
+        d_enc = d_encoder.to(device)
+        d_latents_is  = precompute_latent_series(data_is,  L, features, d_enc, device)
+        d_latents_oos = precompute_latent_series(data_oos, L, features, d_enc, device)
+
+    return FrozenEncoderContext(
+        c_encoder=c_encoder,
+        c_latents_is=c_latents_is,
+        c_latents_oos=c_latents_oos,
+        d_encoder=d_encoder,
+        d_latents_is=d_latents_is,
+        d_latents_oos=d_latents_oos,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers internos
+# ---------------------------------------------------------------------------
+
+def _build_env_kwargs(cfg: ExperimentConfig, data: pd.DataFrame) -> dict:
+    """Construye kwargs para FinancialEnv respetando el desacople obs/ejecución."""
+    feature_cols = list(cfg.features) if cfg.features else None
+    return dict(
+        lookback_window=cfg.lookback_window,
+        initial_balance=cfg.initial_balance,
+        transaction_cost=cfg.transaction_cost,
+        feature_cols=feature_cols,
+        price_col="close",
+    )
+
+
+def _make_latent_agent(
+    env: FinancialEnv,
+    cfg: ExperimentConfig,
+    freeze_encoder: bool = False,
+) -> LatentDQNAgent:
+    """Crea un LatentDQNAgent con el encoder_type de cfg."""
+    kwargs = cfg.encoder_kwargs()
+    return LatentDQNAgent(
+        action_space=env.action_space,
+        observation_shape=env.observation_space.shape,
+        latent_dim=cfg.latent_dim,
+        encoder_type=cfg.encoder_type,
+        encoder_hidden_dims=cfg.encoder_hidden_dims,
+        encoder_dropout=cfg.encoder_dropout,
+        encoder_activation=cfg.encoder_activation,
+        tcn_kernel_size=cfg.tcn_kernel_size,
+        tcn_dilations=cfg.tcn_dilations,
+        tcn_channels=cfg.tcn_channels,
+        gru_hidden_dim=cfg.gru_hidden_dim,
+        gru_num_layers=cfg.gru_num_layers,
+        learning_rate=cfg.latent_lr,
+        gamma=cfg.latent_gamma,
+        epsilon_start=cfg.latent_epsilon_start,
+        epsilon_end=cfg.latent_epsilon_end,
+        epsilon_decay=cfg.latent_epsilon_decay,
+        batch_size=cfg.latent_batch_size,
+        buffer_capacity=cfg.latent_buffer_capacity,
+        target_update_freq=cfg.latent_target_update,
+        q_hidden_dim=cfg.latent_q_hidden_dim,
+        freeze_encoder=freeze_encoder,
+        device=cfg.device,
+    )
+
+
+def _make_precomputed_latent_agent(
+    env,
+    cfg: ExperimentConfig,
+) -> LatentDQNAgent:
+    """Crea un LatentDQNAgent en modo precomputed_latents (sin encoder interno)."""
+    return LatentDQNAgent(
+        action_space=env.action_space,
+        observation_shape=(cfg.latent_dim,),
+        latent_dim=cfg.latent_dim,
+        precomputed_latents=True,
+        learning_rate=cfg.latent_lr,
+        gamma=cfg.latent_gamma,
+        epsilon_start=cfg.latent_epsilon_start,
+        epsilon_end=cfg.latent_epsilon_end,
+        epsilon_decay=cfg.latent_epsilon_decay,
+        batch_size=cfg.latent_batch_size,
+        buffer_capacity=cfg.latent_buffer_capacity,
+        target_update_freq=cfg.latent_target_update,
+        q_hidden_dim=cfg.latent_q_hidden_dim,
+        device=cfg.device,
+    )
+
+
+def _train_agent(env, agent, n_episodes: int, cfg: ExperimentConfig):
+    """Bucle de entrenamiento RL genérico."""
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        step = 0
+        while not done and step < cfg.max_steps_per_episode:
+            action = agent.select_action(obs, training=True)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            agent.store_transition(obs, action, reward, next_obs, done)
+            if len(agent.replay_buffer) >= agent.batch_size:
+                agent.update()
+            obs = next_obs
+            step += 1
+    return agent
+
+
+# ---------------------------------------------------------------------------
+# Entrenamiento de agentes (API pública)
 # ---------------------------------------------------------------------------
 
 def train_dqn_agent(
@@ -45,19 +247,7 @@ def train_dqn_agent(
     n_episodes: int,
     cfg: ExperimentConfig,
 ) -> DQNAgent:
-    """
-    Crea y entrena un DQNAgent sobre el entorno dado.
-
-    El entorno debe corresponder al split IS para evitar data leakage.
-
-    Args:
-        env: Entorno financiero (IS).
-        n_episodes: Número de episodios de entrenamiento.
-        cfg: Configuración del experimento con los hiperparámetros del DQN.
-
-    Returns:
-        Agente DQN entrenado.
-    """
+    """Crea y entrena un DQNAgent sobre el entorno IS."""
     agent = DQNAgent(
         action_space=env.action_space,
         observation_shape=env.observation_space.shape,
@@ -72,25 +262,7 @@ def train_dqn_agent(
         hidden_dim=cfg.dqn_hidden_dim,
         device=cfg.device,
     )
-
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
-        done = False
-        step = 0
-
-        while not done and step < cfg.max_steps_per_episode:
-            action = agent.select_action(obs, training=True)
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-
-            agent.store_transition(obs, action, reward, next_obs, done)
-            if len(agent.replay_buffer) >= agent.batch_size:
-                agent.update()
-
-            obs = next_obs
-            step += 1
-
-    return agent
+    return _train_agent(env, agent, n_episodes, cfg)
 
 
 def train_latent_dqn_agent(
@@ -100,64 +272,36 @@ def train_latent_dqn_agent(
     pretrained: bool = False,
     pretraining_data: Optional[pd.DataFrame] = None,
 ) -> LatentDQNAgent:
+    """Crea y entrena un LatentDQNAgent (legado, mantiene pretrained=bool API).
+
+    Para los brazos C/D con el nuevo protocolo usar las funciones
+    ``_train_arm_c`` / ``_train_arm_d`` directamente.
     """
-    Crea y entrena un LatentDQNAgent, opcionalmente con encoder preentrenado.
-
-    El preentrenamiento usa SOLO datos IS (pretraining_data) para evitar
-    data leakage: el encoder nunca ve datos OOS antes de la evaluación.
-
-    Args:
-        env: Entorno financiero (IS).
-        n_episodes: Número de episodios de entrenamiento RL.
-        cfg: Configuración del experimento con todos los hiperparámetros.
-        pretrained: Si True, preentrenar el encoder antes del RL.
-        pretraining_data: DataFrame IS para preentrenamiento (requerido si pretrained=True).
-
-    Returns:
-        Agente LatentDQN entrenado.
-
-    Raises:
-        ValueError: Si pretrained=True y pretraining_data es None.
-    """
-    agent = LatentDQNAgent(
-        action_space=env.action_space,
-        observation_shape=env.observation_space.shape,
-        latent_dim=cfg.latent_dim,
-        encoder_hidden_dims=cfg.encoder_hidden_dims,
-        encoder_dropout=cfg.encoder_dropout,
-        encoder_activation=cfg.encoder_activation,
-        learning_rate=cfg.latent_lr,
-        gamma=cfg.latent_gamma,
-        epsilon_start=cfg.latent_epsilon_start,
-        epsilon_end=cfg.latent_epsilon_end,
-        epsilon_decay=cfg.latent_epsilon_decay,
-        batch_size=cfg.latent_batch_size,
-        buffer_capacity=cfg.latent_buffer_capacity,
-        target_update_freq=cfg.latent_target_update,
-        q_hidden_dim=cfg.latent_q_hidden_dim,
-        device=cfg.device,
-    )
+    agent = _make_latent_agent(env, cfg, freeze_encoder=False)
 
     if pretrained:
         if pretraining_data is None:
             raise ValueError("pretraining_data es requerido cuando pretrained=True")
 
-        input_dim = cfg.lookback_window * 5  # 5 features OHLCV
-        encoder = MLPLatentEncoder(
+        # Preentrenamiento legado con AutoencoderTrainer (MLP flat)
+        L = cfg.lookback_window
+        F = len(cfg.features) if cfg.features else 5
+        input_dim = L * F
+        encoder_mlp = MLPLatentEncoder(
             input_dim=input_dim,
             latent_dim=cfg.latent_dim,
             hidden_dims=cfg.encoder_hidden_dims,
             activation=cfg.encoder_activation,
             dropout=cfg.encoder_dropout,
+            input_len=L,
+            n_features=F,
         )
-
         trainer = AutoencoderTrainer(
-            encoder=encoder,
+            encoder=encoder_mlp,
             learning_rate=cfg.pretrain_lr,
             batch_size=cfg.pretrain_batch_size,
             device=cfg.device,
         )
-
         observations = trainer.collect_observations(
             data=pretraining_data,
             lookback_window=cfg.lookback_window,
@@ -171,24 +315,95 @@ def train_latent_dqn_agent(
             trainer.save_encoder(str(encoder_path))
             agent.load_pretrained_encoder(str(encoder_path))
 
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
-        done = False
-        step = 0
+    return _train_agent(env, agent, n_episodes, cfg)
 
-        while not done and step < cfg.max_steps_per_episode:
-            action = agent.select_action(obs, training=True)
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
 
-            agent.store_transition(obs, action, reward, next_obs, done)
-            if len(agent.replay_buffer) >= agent.batch_size:
-                agent.update()
+# ---------------------------------------------------------------------------
+# Brazos individuales
+# ---------------------------------------------------------------------------
 
-            obs = next_obs
-            step += 1
+def _train_arm_a(env: FinancialEnv, n_episodes: int, cfg: ExperimentConfig) -> DQNAgent:
+    """Brazo A: DQNAgent directo."""
+    return train_dqn_agent(env, n_episodes, cfg)
 
-    return agent
+
+def _train_arm_b(env: FinancialEnv, n_episodes: int, cfg: ExperimentConfig) -> LatentDQNAgent:
+    """Brazo B: LatentDQNAgent encoder random, finetune."""
+    agent = _make_latent_agent(env, cfg, freeze_encoder=False)
+    return _train_agent(env, agent, n_episodes, cfg)
+
+
+def _train_arm_c(
+    env: FinancialEnv,
+    n_episodes: int,
+    cfg: ExperimentConfig,
+    data_is: pd.DataFrame,
+) -> LatentDQNAgent:
+    """Brazo C: encoder ligero pretrained en IS del pliegue, frozen."""
+    from latent_rl.pretraining.encoder_pretrainer import EncoderPretrainer
+    from latent_rl.representations.artifact import save_encoder_artifact, load_encoder_artifact
+
+    L = cfg.lookback_window
+    F = len(cfg.features) if cfg.features else env.n_features
+
+    encoder = build_encoder(
+        cfg.encoder_type,
+        input_len=L,
+        n_features=F,
+        **cfg.encoder_kwargs(),
+    )
+    pretrainer = EncoderPretrainer(
+        encoder=encoder,
+        learning_rate=cfg.pretrain_lr,
+        batch_size=cfg.pretrain_batch_size,
+        lambda_forecast=cfg.pretrain_lambda_forecast,
+        k=cfg.pretrain_k_forecast,
+        device=cfg.device,
+    )
+
+    features = list(cfg.features) if cfg.features else []
+    if features and "log_return" in features:
+        X, Y = pretrainer.make_windows(data_is, features, L)
+        if len(X) > 0:
+            pretrainer.train(
+                X=X,
+                Y=Y,
+                n_epochs=cfg.pretrain_n_epochs,
+                val_ratio=0.1,
+                early_stopping_patience=5,
+            )
+
+    # Guardar y cargar vía artefacto para construir el agente correctamente
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        enc_path = Path(tmp_dir) / "arm_c_encoder.pt"
+        save_encoder_artifact(encoder, norm_stats={}, provenance={}, path=enc_path)
+
+        agent = _make_latent_agent(env, cfg, freeze_encoder=True)
+        loaded_enc, _, _ = load_encoder_artifact(enc_path)
+        agent.encoder = loaded_enc.to(agent.device)
+        agent.encoder.freeze()
+
+    return _train_agent(env, agent, n_episodes, cfg)
+
+
+def _train_arm_d(
+    env: FinancialEnv,
+    n_episodes: int,
+    cfg: ExperimentConfig,
+) -> Optional[LatentDQNAgent]:
+    """Brazo D: encoder heavy offline, frozen. Omite si no hay ruta configurada."""
+    if not cfg.heavy_encoder_path:
+        print("  Brazo D omitido: heavy_encoder_path no configurado.")
+        return None
+
+    agent = _make_latent_agent(env, cfg, freeze_encoder=True)
+    try:
+        agent.load_artifact_encoder(cfg.heavy_encoder_path, cfg=cfg)
+    except Exception as exc:
+        print(f"  Brazo D omitido: error cargando artefacto ({exc})")
+        return None
+
+    return _train_agent(env, agent, n_episodes, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -200,80 +415,105 @@ def run_single_seed(
     data_is: pd.DataFrame,
     data_oos: pd.DataFrame,
     cfg: ExperimentConfig,
+    frozen_ctx: Optional[FrozenEncoderContext] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Ejecuta el experimento completo para una semilla específica.
 
-    Los datos IS y OOS deben estar ya divididos antes de llamar a esta función
-    (split temporal idéntico para todas las semillas). La semilla controla
-    únicamente la inicialización estocástica de los agentes.
+    Construye los brazos definidos en ``cfg.run_arms``.  Los resultados se
+    indexan por "A", "B", "C", "D" (plus "RandomAgent", "BuyAndHoldAgent").
 
     Args:
         seed: Semilla aleatoria (afecta solo a los agentes, no a los datos).
-        data_is: DataFrame IS con columnas OHLCV en minúsculas.
-        data_oos: DataFrame OOS con columnas OHLCV en minúsculas.
+        data_is: DataFrame IS con columnas OHLCV + features en minúsculas.
+        data_oos: DataFrame OOS con columnas OHLCV + features en minúsculas.
         cfg: Configuración del experimento.
+        frozen_ctx: Latentes precomputados para brazos C y D. Si None, los
+            brazos C y D usan el path original (entrena encoder + recalcula
+            en cada paso de RL).
 
     Returns:
-        ``results[agent_name]["is" | "oos"]`` con el dict de métricas de evaluate_agent.
+        ``results[arm_name]["is" | "oos"]`` con el dict de métricas.
     """
     print(f"\n--- Ejecutando semilla {seed} ---")
     np.random.seed(seed)
 
-    env_kwargs = dict(
-        lookback_window=cfg.lookback_window,
-        initial_balance=cfg.initial_balance,
-        transaction_cost=cfg.transaction_cost,
-    )
-    env_is  = FinancialEnv(data=data_is,  **env_kwargs)
-    env_oos = FinancialEnv(data=data_oos, **env_kwargs)
+    env_kw = _build_env_kwargs(cfg, data_is)
+    env_is  = FinancialEnv(data=data_is,  **env_kw)
+    env_oos = FinancialEnv(data=data_oos, **env_kw)
 
     n_train = cfg.n_training_episodes
     n_eval  = cfg.n_eval_episodes
     results: Dict[str, Dict[str, Any]] = {}
 
-    # 1. RandomAgent
+    # Agentes de referencia (siempre)
     random_agent = RandomAgent(action_space=env_is.action_space, seed=seed)
     results["RandomAgent"] = {
         "is":  evaluate_agent(random_agent, env_is,  "RandomAgent", n_eval),
         "oos": evaluate_agent(random_agent, env_oos, "RandomAgent", n_eval),
     }
-
-    # 2. BuyAndHoldAgent
     bah_agent = BuyAndHoldAgent(action_space=env_is.action_space)
     results["BuyAndHoldAgent"] = {
         "is":  evaluate_agent(bah_agent, env_is,  "BuyAndHoldAgent", n_eval),
         "oos": evaluate_agent(bah_agent, env_oos, "BuyAndHoldAgent", n_eval),
     }
 
-    # 3. DQNAgent — entrenado solo en IS
-    dqn_agent = train_dqn_agent(env_is, n_episodes=n_train, cfg=cfg)
-    results["DQNAgent"] = {
-        "is":  evaluate_agent(dqn_agent, env_is,  "DQNAgent", n_eval),
-        "oos": evaluate_agent(dqn_agent, env_oos, "DQNAgent", n_eval),
-    }
+    arms = cfg.run_arms
 
-    # 4. LatentDQNAgent sin preentrenamiento — entrenado solo en IS
-    latent_agent = train_latent_dqn_agent(
-        env_is, n_episodes=n_train, cfg=cfg, pretrained=False
-    )
-    results["LatentDQNAgent (no pretrained)"] = {
-        "is":  evaluate_agent(latent_agent, env_is,  "LatentDQNAgent (no pretrained)", n_eval),
-        "oos": evaluate_agent(latent_agent, env_oos, "LatentDQNAgent (no pretrained)", n_eval),
-    }
+    if "A" in arms:
+        agent_a = _train_arm_a(env_is, n_train, cfg)
+        results["A"] = {
+            "is":  evaluate_agent(agent_a, env_is,  "A", n_eval),
+            "oos": evaluate_agent(agent_a, env_oos, "A", n_eval),
+        }
 
-    # 5. LatentDQNAgent con encoder preentrenado — preentrenamiento y RL solo en IS
-    latent_pretrained = train_latent_dqn_agent(
-        env_is,
-        n_episodes=n_train,
-        cfg=cfg,
-        pretrained=True,
-        pretraining_data=data_is,  # solo IS — sin data leakage
-    )
-    results["LatentDQNAgent (pretrained)"] = {
-        "is":  evaluate_agent(latent_pretrained, env_is,  "LatentDQNAgent (pretrained)", n_eval),
-        "oos": evaluate_agent(latent_pretrained, env_oos, "LatentDQNAgent (pretrained)", n_eval),
-    }
+    if "B" in arms:
+        agent_b = _train_arm_b(env_is, n_train, cfg)
+        results["B"] = {
+            "is":  evaluate_agent(agent_b, env_is,  "B", n_eval),
+            "oos": evaluate_agent(agent_b, env_oos, "B", n_eval),
+        }
+
+    if "C" in arms:
+        if frozen_ctx is not None and frozen_ctx.c_latents_is is not None:
+            # Ruta optimizada: latentes precomputados, sin correr el encoder en RL
+            w_c_is  = LatentObservationWrapper(FinancialEnv(data=data_is,  **env_kw), frozen_ctx.c_latents_is)
+            w_c_oos = LatentObservationWrapper(FinancialEnv(data=data_oos, **env_kw), frozen_ctx.c_latents_oos)
+            agent_c = _make_precomputed_latent_agent(w_c_is, cfg)
+            _train_agent(w_c_is, agent_c, n_train, cfg)
+            results["C"] = {
+                "is":  evaluate_agent(agent_c, w_c_is,  "C", n_eval),
+                "oos": evaluate_agent(agent_c, w_c_oos, "C", n_eval),
+            }
+            w_c_is.close()
+            w_c_oos.close()
+        else:
+            agent_c = _train_arm_c(env_is, n_train, cfg, data_is)
+            results["C"] = {
+                "is":  evaluate_agent(agent_c, env_is,  "C", n_eval),
+                "oos": evaluate_agent(agent_c, env_oos, "C", n_eval),
+            }
+
+    if "D" in arms:
+        if frozen_ctx is not None and frozen_ctx.d_latents_is is not None:
+            # Ruta optimizada: latentes precomputados del encoder gordo offline
+            w_d_is  = LatentObservationWrapper(FinancialEnv(data=data_is,  **env_kw), frozen_ctx.d_latents_is)
+            w_d_oos = LatentObservationWrapper(FinancialEnv(data=data_oos, **env_kw), frozen_ctx.d_latents_oos)
+            agent_d = _make_precomputed_latent_agent(w_d_is, cfg)
+            _train_agent(w_d_is, agent_d, n_train, cfg)
+            results["D"] = {
+                "is":  evaluate_agent(agent_d, w_d_is,  "D", n_eval),
+                "oos": evaluate_agent(agent_d, w_d_oos, "D", n_eval),
+            }
+            w_d_is.close()
+            w_d_oos.close()
+        else:
+            agent_d = _train_arm_d(env_is, n_train, cfg)
+            if agent_d is not None:
+                results["D"] = {
+                    "is":  evaluate_agent(agent_d, env_is,  "D", n_eval),
+                    "oos": evaluate_agent(agent_d, env_oos, "D", n_eval),
+                }
 
     env_is.close()
     env_oos.close()
@@ -288,72 +528,141 @@ def run_single_seed(
 def compute_ivl(
     aggregated: Dict[str, Dict[str, float]],
     cfg: ExperimentConfig,
+    ticker: str = "",
+    window: int = -1,
 ) -> List[Dict[str, Any]]:
     """
-    Calcula el IVL comparando cada agente latente contra el agente directo.
+    Recoge los registros IVL crudos (sin normalización) para un ticker.
+
+    La normalización por componente se aplica a nivel de experimento en
+    ``_finalize_ivl_records``, una vez disponibles todos los pares
+    (ticker, ventana). Las métricas usan Sharpe OOS y MDD OOS (no IS).
 
     Args:
         aggregated: Resultado de aggregate_results().
-        cfg: Configuración del experimento (define direct_agent, latent_agents,
-             e ivl_weights).
+        cfg: Configuración del experimento.
+        ticker: Nombre del ticker (incluido en cada registro para trazabilidad).
+        window: Índice de ventana WF (-1 cuando no se usa WF).
 
     Returns:
-        Lista de dicts con los resultados del IVL (uno por par directo-latente).
+        Lista de dicts con deltas crudos (sin IVL ni normalización finales).
     """
     if cfg.direct_agent not in aggregated:
         print(f"  Advertencia: agente directo '{cfg.direct_agent}' no encontrado, omitiendo IVL.")
         return []
 
-    ivl_calc = LatentAdvantageIndex(weights=cfg.ivl_weights)
-
     def _metrics(name: str) -> Dict[str, float]:
         row = aggregated[name]
         return {
-            "sharpe":       row["mean_sharpe_is"],
-            "max_drawdown": row["mean_mdd_is"],
-            "seed_std":     row["seed_std_return_is"],
-            "perf_is":      row["mean_return_is"],
-            "perf_oos":     row["mean_return_oos"],
+            "sharpe_oos":          row["mean_sharpe_oos"],
+            "mdd_oos":             row["mean_mdd_oos"],
+            "seed_std_sharpe_oos": row["seed_std_sharpe_oos"],
+            "sharpe_is":           row["mean_sharpe_is"],
         }
 
-    direct_metrics = _metrics(cfg.direct_agent)
+    direct_m = _metrics(cfg.direct_agent)
+    direct_row = aggregated[cfg.direct_agent]
     records = []
+    ivl_calc = LatentAdvantageIndex(weights=cfg.ivl_weights)
 
     for latent_name in cfg.latent_agents:
         if latent_name not in aggregated:
             print(f"  Advertencia: '{latent_name}' no encontrado en resultados, omitiendo.")
             continue
 
-        result = ivl_calc.compute(direct_metrics, _metrics(latent_name))
-
-        direct_row = aggregated[cfg.direct_agent]
+        latent_m = _metrics(latent_name)
+        # Calcula deltas crudos (sin scales -> sin normalización)
+        result = ivl_calc.compute(direct_m, latent_m, scales=None)
         latent_row = aggregated[latent_name]
+
         records.append({
-            "direct_agent":      cfg.direct_agent,
-            "latent_agent":      latent_name,
-            "ivl":               result["ivl"],
-            "delta_sharpe":      result["delta_sharpe"],
-            "delta_mdd":         result["delta_mdd"],
-            "delta_seed_std":    result["delta_seed_std"],
-            "delta_is_oos_gap":  result["delta_is_oos_gap"],
-            "interpretation":    result["interpretation"],
-            "direct_sharpe_is":  direct_row["mean_sharpe_is"],
-            "direct_return_is":  direct_row["mean_return_is"],
-            "direct_return_oos": direct_row["mean_return_oos"],
-            "latent_sharpe_is":  latent_row["mean_sharpe_is"],
-            "latent_return_is":  latent_row["mean_return_is"],
-            "latent_return_oos": latent_row["mean_return_oos"],
+            "ticker":             ticker,
+            "window":             window,
+            "direct_agent":       cfg.direct_agent,
+            "latent_agent":       latent_name,
+            # Deltas crudos (antes de normalización)
+            "delta_sharpe":       result["delta_sharpe"],
+            "delta_mdd":          result["delta_mdd"],
+            "delta_seed_std":     result["delta_seed_std"],
+            "delta_is_oos_gap":   result["delta_is_oos_gap"],
+            # Placeholders — rellenados por _finalize_ivl_records
+            "delta_sharpe_norm":     float("nan"),
+            "delta_mdd_norm":        float("nan"),
+            "delta_seed_std_norm":   float("nan"),
+            "delta_is_oos_gap_norm": float("nan"),
+            "ivl":                   float("nan"),
+            "interpretation":        "pending",
+            # Contexto OOS para el dashboard
+            "direct_sharpe_oos":  direct_row["mean_sharpe_oos"],
+            "direct_sharpe_is":   direct_row["mean_sharpe_is"],
+            "direct_return_oos":  direct_row["mean_return_oos"],
+            "latent_sharpe_oos":  latent_row["mean_sharpe_oos"],
+            "latent_sharpe_is":   latent_row["mean_sharpe_is"],
+            "latent_return_oos":  latent_row["mean_return_oos"],
         })
 
-        print(f"\nIVL: {cfg.direct_agent} vs {latent_name}")
-        print(f"  IVL          = {result['ivl']:.4f}")
-        print(f"  d Sharpe     = {result['delta_sharpe']:.4f}")
-        print(f"  d MDD        = {result['delta_mdd']:.4f}")
-        print(f"  d Seed Std   = {result['delta_seed_std']:.4f}")
-        print(f"  d IS/OOS Gap = {result['delta_is_oos_gap']:.4f}")
-        print(f"  Interpretacion: {result['interpretation']}")
-
     return records
+
+
+def _finalize_ivl_records(
+    all_raw: List[Dict[str, Any]],
+    ivl_calc: LatentAdvantageIndex,
+) -> List[Dict[str, Any]]:
+    """
+    Normaliza por componente y calcula el IVL final para todos los registros.
+
+    La escala de cada componente es la std agrupada sobre todos los pares
+    (ticker, ventana) disponibles. Si la std < 1e-8 (p. ej. comparación única
+    o componente constante), esa componente se fija a 0 en el IVL normalizado.
+
+    Args:
+        all_raw: Lista de registros crudos devueltos por compute_ivl.
+        ivl_calc: Instancia de LatentAdvantageIndex (con los pesos del experimento).
+
+    Returns:
+        Lista de registros finalizados con deltas crudos, normalizados e IVL.
+    """
+    if not all_raw:
+        return []
+
+    component_keys = ["delta_sharpe", "delta_mdd", "delta_seed_std", "delta_is_oos_gap"]
+
+    # Escala = std de cada componente sobre todos los registros
+    scales: Dict[str, float] = {}
+    for k in component_keys:
+        vals = [r[k] for r in all_raw if not (r[k] != r[k])]  # excluir NaN
+        scales[k] = float(np.std(vals)) if len(vals) >= 2 else 0.0
+
+    finalized = []
+    for raw in all_raw:
+        def _norm(k: str) -> float:
+            s = scales[k]
+            return raw[k] / s if s > 1e-8 else 0.0
+
+        n_sharpe   = _norm("delta_sharpe")
+        n_mdd      = _norm("delta_mdd")
+        n_seed_std = _norm("delta_seed_std")
+        n_gap      = _norm("delta_is_oos_gap")
+
+        ivl = (
+            ivl_calc.weights["sharpe"]       * n_sharpe
+            - ivl_calc.weights["mdd"]        * n_mdd
+            - ivl_calc.weights["seed_std"]   * n_seed_std
+            - ivl_calc.weights["is_oos_gap"] * n_gap
+        )
+
+        rec = {
+            **raw,
+            "delta_sharpe_norm":     n_sharpe,
+            "delta_mdd_norm":        n_mdd,
+            "delta_seed_std_norm":   n_seed_std,
+            "delta_is_oos_gap_norm": n_gap,
+            "ivl":                   ivl,
+            "interpretation":        ivl_calc.interpret(ivl),
+        }
+        finalized.append(rec)
+
+    return finalized
 
 
 def export_ivl_results(
@@ -364,12 +673,99 @@ def export_ivl_results(
     if not records:
         print("No se calculo ningun IVL.")
         return
+    results_path = Path(results_dir)
+    results_path.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(records).to_csv(results_path / "ivl_results.csv", index=False)
+    print(f"\nResultados IVL guardados en: {results_path / 'ivl_results.csv'}")
+
+
+def _print_ivl_summary(ticker: str, records: List[Dict[str, Any]]) -> None:
+    """Imprime el resumen IVL normalizado para un ticker."""
+    for rec in records:
+        d, l = rec["direct_agent"], rec["latent_agent"]
+        print(f"\nIVL: {d} vs {l}  [{ticker}]")
+        print(f"  IVL (norm)   = {rec['ivl']:+.4f}")
+        print(f"  d Sharpe     = {rec['delta_sharpe']:.4f}  (norm: {rec['delta_sharpe_norm']:+.4f})")
+        print(f"  d MDD        = {rec['delta_mdd']:.4f}  (norm: {rec['delta_mdd_norm']:+.4f})")
+        print(f"  d Seed Std   = {rec['delta_seed_std']:.4f}  (norm: {rec['delta_seed_std_norm']:+.4f})")
+        print(f"  d IS/OOS Gap = {rec['delta_is_oos_gap']:.4f}  (norm: {rec['delta_is_oos_gap_norm']:+.4f})")
+        print(f"  Interpretacion: {rec['interpretation']}")
+
+
+# ---------------------------------------------------------------------------
+# Walk-Forward helpers
+# ---------------------------------------------------------------------------
+
+def _aggregate_wf_windows(
+    wf_window_aggregated: List[Dict[str, Dict[str, float]]],
+) -> Dict[str, Dict[str, float]]:
+    """Promedia las métricas de N ventanas WF para obtener un resumen global.
+
+    Cada ventana ya tiene sus semillas agregadas. Este paso promedia entre
+    ventanas. Solo se promedian las claves numéricas presentes en todas las
+    ventanas; ``"name"`` se conserva de la primera ventana.
+    """
+    if not wf_window_aggregated:
+        return {}
+
+    agent_names = list(wf_window_aggregated[0].keys())
+    result: Dict[str, Dict[str, float]] = {}
+
+    for agent in agent_names:
+        all_windows = [w[agent] for w in wf_window_aggregated if agent in w]
+        if not all_windows:
+            continue
+        numeric_keys = [k for k, v in all_windows[0].items()
+                        if isinstance(v, (int, float)) and k != "name"]
+        row: Dict[str, float] = {"name": all_windows[0].get("name", agent)}
+        for k in numeric_keys:
+            vals = [w[k] for w in all_windows]
+            row[k] = float(np.mean(vals))
+        result[agent] = row
+
+    return result
+
+
+def _export_wf_window_metrics(
+    wf_window_aggregated: List[Dict[str, Dict[str, float]]],
+    results_dir: "str | Path",
+    cfg: ExperimentConfig,
+    ivl_records_per_window: Optional[List[List[Dict[str, Any]]]] = None,
+) -> None:
+    """Exporta ``wf_window_metrics.csv`` con una fila por (ventana, agente).
+
+    Cada fila incluye las métricas IS/OOS agregadas entre semillas para esa
+    ventana, más el IVL de esa ventana si está disponible.
+    """
+    rows = []
+    for wf_idx, window_agg in enumerate(wf_window_aggregated):
+        # IVL por agente latente para esta ventana
+        ivl_lookup: Dict[str, float] = {}
+        if ivl_records_per_window and wf_idx < len(ivl_records_per_window):
+            for rec in ivl_records_per_window[wf_idx]:
+                ivl_lookup[rec["latent_agent"]] = rec.get("ivl", float("nan"))
+
+        for agent_name, metrics in window_agg.items():
+            row = {
+                "window":      wf_idx,
+                "agent":       agent_name,
+            }
+            for k, v in metrics.items():
+                if k != "name":
+                    row[k] = v
+            # Añadir IVL de ventana si disponible
+            if agent_name in ivl_lookup:
+                row["ivl"] = ivl_lookup[agent_name]
+            rows.append(row)
+
+    if not rows:
+        return
 
     results_path = Path(results_dir)
     results_path.mkdir(parents=True, exist_ok=True)
-    output_path = results_path / "ivl_results.csv"
-    pd.DataFrame(records).to_csv(output_path, index=False)
-    print(f"\nResultados IVL guardados en: {output_path}")
+    out_path = results_path / "wf_window_metrics.csv"
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"  wf_window_metrics.csv: {len(rows)} filas -> {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -379,26 +775,15 @@ def export_ivl_results(
 def _run_single_ticker(
     ticker: str,
     cfg: ExperimentConfig,
+    d_encoder: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """
-    Ejecuta el pipeline completo (carga → IS/OOS → semillas → IVL) para un ticker.
-
-    Los CSVs se guardan en ``{results_dir}/{ticker}/``.
-
-    Args:
-        ticker: Símbolo del activo.
-        cfg: Configuración del experimento.
-
-    Returns:
-        Diccionario con ``all_results``, ``aggregated`` e ``ivl_records``.
-    """
+    """Ejecuta el pipeline completo para un ticker."""
     ticker_results_dir = Path(cfg.results_dir) / ticker
 
     print(f"\n{'='*60}")
     print(f"TICKER: {ticker}")
     print(f"{'='*60}")
 
-    # 1. Cargar datos (cache local + features opcionales via TickerConfig)
     params = cfg.resolve_ticker_params(ticker)
     print(
         f"  Periodo: {params['start']} -> {params['end']}  "
@@ -408,26 +793,86 @@ def _run_single_ticker(
     data = load_ticker_with_config(ticker, cfg)
     n_features = data.shape[1]
 
-    # 2. Walk-Forward o split IS/OOS estandar + normalizacion opcional
     if cfg.wf_enabled:
         print(
-            f"  Walk-Forward: {cfg.wf_n_windows} ventanas, "
-            f"is_ratio={cfg.wf_is_ratio} | "
+            f"  Walk-Forward ({cfg.wf_mode}): {cfg.wf_n_windows} ventanas, "
+            f"is_ratio={cfg.wf_is_ratio} | semillas={cfg.seeds} | "
             f"normalizacion={'si' if cfg.normalize_features and cfg.features else 'no'}"
         )
-        splits_wf = walk_forward_splits(data, cfg.wf_n_windows, cfg.wf_is_ratio)
-        all_results = []
+        splits_wf = walk_forward_splits(
+            data, cfg.wf_n_windows, cfg.wf_is_ratio,
+            lookback=cfg.lookback_window,
+        )
+
+        # Resultados estructurados por ventana
+        wf_window_aggregated: List[Dict] = []
+        wf_raw_ivl_per_window: List[List[Dict]] = []
+        all_seed_results_flat: List[Dict] = []  # para export_dashboard_results
+
         for wf_idx, (wf_is, wf_oos) in enumerate(splits_wf):
             print(
-                f"  WF ventana {wf_idx + 1}/{cfg.wf_n_windows}: "
+                f"\n  WF ventana {wf_idx + 1}/{cfg.wf_n_windows}: "
                 f"IS={len(wf_is)} filas  OOS={len(wf_oos)} filas  n_features={n_features}"
             )
             if cfg.normalize_features and cfg.features:
                 wf_is, wf_oos, _ = normalize_is_oos(wf_is, wf_oos)
-            seed_results = run_single_seed(
-                seed=cfg.seeds[0], data_is=wf_is, data_oos=wf_oos, cfg=cfg
-            )
-            all_results.append(seed_results)
+
+            # Encoder de D no se reentrena; el encoder de C se entrena una vez
+            # por ventana (IS crece, stats cambian). Anti-fuga de D: el encoder
+            # gordo fue preentrenado con un universo disjunto por activo, así que
+            # no ha visto este activo en ninguna ventana.
+            frozen_ctx = _build_frozen_ctx(wf_is, wf_oos, cfg, d_encoder)
+
+            # Todas las semillas dentro de esta ventana
+            window_seed_results: List[Dict] = []
+            for seed in cfg.seeds:
+                sr = run_single_seed(
+                    seed=seed, data_is=wf_is, data_oos=wf_oos,
+                    cfg=cfg, frozen_ctx=frozen_ctx,
+                )
+                window_seed_results.append(sr)
+                all_seed_results_flat.append(sr)
+
+            # Agregar entre semillas dentro de la ventana
+            window_agg = aggregate_results(window_seed_results)
+            wf_window_aggregated.append(window_agg)
+
+            print(f"  Resumen ventana {wf_idx + 1} (media semillas):")
+            for arm_name, metrics in window_agg.items():
+                print(
+                    f"    {arm_name}: "
+                    f"IS={metrics['mean_return_is']:.4f} (Sharpe={metrics['mean_sharpe_is']:.3f}) | "
+                    f"OOS={metrics['mean_return_oos']:.4f} (Sharpe={metrics['mean_sharpe_oos']:.3f})"
+                )
+
+            # IVL crudo de esta ventana
+            window_ivl = compute_ivl(window_agg, cfg, ticker=ticker, window=wf_idx)
+            wf_raw_ivl_per_window.append(window_ivl)
+
+        # Agregado global (promedio entre ventanas) para los CSV del dashboard
+        aggregated = _aggregate_wf_windows(wf_window_aggregated)
+        print_summary_table(aggregated)
+        print_ranking(aggregated)
+        export_dashboard_results(
+            all_seed_results_flat, aggregated, results_dir=ticker_results_dir
+        )
+
+        # Exportar métricas por ventana (incluyendo IVL provisional)
+        _export_wf_window_metrics(
+            wf_window_aggregated, ticker_results_dir, cfg,
+            ivl_records_per_window=wf_raw_ivl_per_window,
+        )
+
+        # Aplanar registros IVL de todas las ventanas para normalización cross-ticker
+        raw_ivl_records = [rec for win in wf_raw_ivl_per_window for rec in win]
+
+        return {
+            "ticker":                ticker,
+            "all_results":           all_seed_results_flat,
+            "aggregated":            aggregated,
+            "raw_ivl_records":       raw_ivl_records,
+            "wf_window_aggregated":  wf_window_aggregated,
+        }
     else:
         data_is, data_oos = split_data(data, train_ratio=cfg.train_ratio)
         print(f"  IS: {len(data_is)} filas  |  OOS: {len(data_oos)} filas  |  n_features: {n_features}")
@@ -436,38 +881,41 @@ def _run_single_ticker(
             data_is, data_oos, _ = normalize_is_oos(data_is, data_oos)
             print("  Normalizacion z-score aplicada (ajuste en IS, sin leakage a OOS).")
 
+        # Precomputa latentes para C y D una sola vez (antes del bucle de semillas)
+        frozen_ctx = _build_frozen_ctx(data_is, data_oos, cfg, d_encoder)
+
         all_results = []
         for seed in cfg.seeds:
             seed_results = run_single_seed(
-                seed=seed, data_is=data_is, data_oos=data_oos, cfg=cfg
+                seed=seed, data_is=data_is, data_oos=data_oos, cfg=cfg,
+                frozen_ctx=frozen_ctx,
             )
             all_results.append(seed_results)
 
             print(f"\nResumen semilla {seed}:")
-            for agent_name, splits in seed_results.items():
+            for arm_name, splits in seed_results.items():
                 m_is  = splits["is"]
                 m_oos = splits["oos"]
                 print(
-                    f"  {agent_name}: "
+                    f"  {arm_name}: "
                     f"IS={m_is['total_return']:.4f} (Sharpe={m_is['sharpe']:.3f}) | "
                     f"OOS={m_oos['total_return']:.4f} (Sharpe={m_oos['sharpe']:.3f})"
                 )
 
-    # 3. Agregar y exportar
     aggregated = aggregate_results(all_results)
     print_summary_table(aggregated)
     print_ranking(aggregated)
     export_dashboard_results(all_results, aggregated, results_dir=ticker_results_dir)
 
-    # 4. IVL
-    ivl_records = compute_ivl(aggregated, cfg)
-    export_ivl_results(ivl_records, results_dir=ticker_results_dir)
+    # IVL: solo recoge componentes crudas. La normalización y el export
+    # se realizan en run_experiment, tras tener todos los tickers.
+    raw_ivl_records = compute_ivl(aggregated, cfg, ticker=ticker)
 
     return {
-        "ticker":      ticker,
-        "all_results": all_results,
-        "aggregated":  aggregated,
-        "ivl_records": ivl_records,
+        "ticker":          ticker,
+        "all_results":     all_results,
+        "aggregated":      aggregated,
+        "raw_ivl_records": raw_ivl_records,
     }
 
 
@@ -479,56 +927,42 @@ def aggregate_ticker_results(
     results_per_ticker: Dict[str, Dict[str, Any]],
     cfg: ExperimentConfig,
 ) -> pd.DataFrame:
-    """
-    Genera un resumen cross-ticker del IVL por par (directo, latente).
+    """Genera un resumen cross-ticker del IVL por par (directo, latente).
 
-    Para cada latent_agent, calcula media y desviación típica del IVL sobre
-    todos los tickers, lo que permite evaluar la consistencia de la ventaja
-    latente entre activos.
-
-    Args:
-        results_per_ticker: Diccionario ``{ticker: single_ticker_result}``.
-        cfg: Configuración del experimento.
-
-    Returns:
-        DataFrame con columnas:
-        ticker, latent_agent, ivl, delta_sharpe, delta_mdd, delta_seed_std,
-        delta_is_oos_gap, interpretation
-        más filas de resumen (mean/std) por latent_agent.
+    Espera registros ya finalizados (con campo ``ticker`` y ``ivl`` numérico).
     """
     rows = []
-    for ticker, ticker_result in results_per_ticker.items():
+    for ticker_result in results_per_ticker.values():
         for record in ticker_result.get("ivl_records", []):
-            rows.append({"ticker": ticker, **record})
+            # Los registros finalizados ya contienen el campo "ticker"
+            rows.append(record)
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
-    # Filas de resumen: media y std del IVL por agente latente
     summary_rows = []
     for latent_agent in df["latent_agent"].unique():
         sub = df[df["latent_agent"] == latent_agent]
         summary_rows.append({
-            "ticker":        "MEAN",
-            "latent_agent":  latent_agent,
-            "ivl":           sub["ivl"].mean(),
-            "delta_sharpe":  sub["delta_sharpe"].mean(),
-            "delta_mdd":     sub["delta_mdd"].mean(),
-            "delta_seed_std":sub["delta_seed_std"].mean(),
-            "delta_is_oos_gap": sub["delta_is_oos_gap"].mean(),
-            "interpretation": "mean_across_tickers",
+            "ticker":          "MEAN",
+            "latent_agent":    latent_agent,
+            "ivl":             sub["ivl"].mean(),
+            "delta_sharpe":    sub["delta_sharpe"].mean(),
+            "delta_mdd":       sub["delta_mdd"].mean(),
+            "delta_seed_std":  sub["delta_seed_std"].mean(),
+            "delta_is_oos_gap":sub["delta_is_oos_gap"].mean(),
+            "interpretation":  "mean_across_tickers",
         })
         summary_rows.append({
-            "ticker":        "STD",
-            "latent_agent":  latent_agent,
-            "ivl":           sub["ivl"].std(),
-            "delta_sharpe":  sub["delta_sharpe"].std(),
-            "delta_mdd":     sub["delta_mdd"].std(),
-            "delta_seed_std":sub["delta_seed_std"].std(),
-            "delta_is_oos_gap": sub["delta_is_oos_gap"].std(),
-            "interpretation": "std_across_tickers",
+            "ticker":          "STD",
+            "latent_agent":    latent_agent,
+            "ivl":             sub["ivl"].std(),
+            "delta_sharpe":    sub["delta_sharpe"].std(),
+            "delta_mdd":       sub["delta_mdd"].std(),
+            "delta_seed_std":  sub["delta_seed_std"].std(),
+            "delta_is_oos_gap":sub["delta_is_oos_gap"].std(),
+            "interpretation":  "std_across_tickers",
         })
 
     return pd.concat([df, pd.DataFrame(summary_rows)], ignore_index=True)
@@ -543,13 +977,11 @@ def export_cross_ticker_results(
         return
     results_path = Path(cfg.results_dir)
     results_path.mkdir(parents=True, exist_ok=True)
-    output_path = results_path / "ticker_comparison.csv"
-    cross_df.to_csv(output_path, index=False)
-    print(f"\nComparacion cross-ticker guardada en: {output_path}")
+    cross_df.to_csv(results_path / "ticker_comparison.csv", index=False)
+    print(f"\nComparacion cross-ticker guardada en: {results_path / 'ticker_comparison.csv'}")
 
 
 def _print_cross_ticker_summary(cross_df: pd.DataFrame) -> None:
-    """Imprime un resumen legible del IVL por ticker y agente latente."""
     if cross_df.empty:
         return
     detail = cross_df[~cross_df["ticker"].isin(["MEAN", "STD"])]
@@ -563,7 +995,6 @@ def _print_cross_ticker_summary(cross_df: pd.DataFrame) -> None:
             f"{row['ticker']:<12} {row['latent_agent']:<38} "
             f"{row['ivl']:>+8.4f}  {row['interpretation']}"
         )
-
     mean_rows = cross_df[cross_df["ticker"] == "MEAN"]
     if not mean_rows.empty:
         print("\nMedia sobre tickers:")
@@ -577,26 +1008,7 @@ def _print_cross_ticker_summary(cross_df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def run_experiment(cfg: Optional[ExperimentConfig] = None) -> Dict[str, Any]:
-    """
-    Ejecuta el pipeline experimental completo para todos los tickers de cfg.tickers.
-
-    Por cada ticker:
-        1. Descarga datos reales de Yahoo Finance.
-        2. Divide temporalmente en IS y OOS.
-        3. Para cada semilla: entrena todos los agentes en IS y evalúa en IS+OOS.
-        4. Agrega resultados y calcula el IVL.
-        5. Exporta CSVs a ``{results_dir}/{ticker}/``.
-
-    Si hay más de un ticker, genera además ``{results_dir}/ticker_comparison.csv``
-    con el IVL agregado entre activos.
-
-    Args:
-        cfg: Configuración del experimento. Si None, usa ExperimentConfig() por defecto.
-
-    Returns:
-        Diccionario ``{ticker: {"all_results", "aggregated", "ivl_records"}}``
-        más clave ``"cross_ticker"`` (DataFrame) cuando hay múltiples tickers.
-    """
+    """Ejecuta el pipeline experimental completo para todos los tickers."""
     if cfg is None:
         cfg = ExperimentConfig()
 
@@ -607,15 +1019,49 @@ def run_experiment(cfg: Optional[ExperimentConfig] = None) -> Dict[str, Any]:
     print(f"Periodo: {cfg.start_date} -> {cfg.end_date}  |  N_OBS: {'todos' if cfg.n_obs is None else cfg.n_obs}")
     print(f"Split IS/OOS: {int(cfg.train_ratio*100)}% / {int((1-cfg.train_ratio)*100)}%")
     print(f"Semillas: {cfg.seeds}  |  Episodios: train={cfg.n_training_episodes}, eval={cfg.n_eval_episodes}")
-    print(f"LatentDQN: latent_dim={cfg.latent_dim}, encoder={cfg.encoder_hidden_dims}, dropout={cfg.encoder_dropout}")
+    print(f"Brazos: {cfg.run_arms}  |  encoder_type: {cfg.encoder_type}  |  latent_dim: {cfg.latent_dim}")
     print(f"IVL pesos: {cfg.ivl_weights}  |  Resultados en: {cfg.results_dir}/")
 
+    # Carga el encoder gordo (brazo D) una sola vez para todos los tickers
+    d_encoder: Optional[Any] = None
+    if "D" in cfg.run_arms and cfg.heavy_encoder_path:
+        try:
+            from latent_rl.representations.artifact import load_encoder_artifact
+            d_encoder, _, _ = load_encoder_artifact(cfg.heavy_encoder_path, cfg=cfg)
+            d_encoder.eval()
+            for p in d_encoder.parameters():
+                p.requires_grad_(False)
+            print(f"  Encoder gordo (brazo D) cargado desde: {cfg.heavy_encoder_path}")
+        except Exception as exc:
+            print(f"  Brazo D: error cargando artefacto ({exc}). Brazo D sera omitido.")
+
     results_per_ticker: Dict[str, Any] = {}
-
     for ticker in cfg.tickers:
-        results_per_ticker[ticker] = _run_single_ticker(ticker, cfg)
+        results_per_ticker[ticker] = _run_single_ticker(ticker, cfg, d_encoder=d_encoder)
 
-    # Cross-ticker: solo si hay más de un ticker
+    # ---------------------------------------------------------------------------
+    # IVL: normalización cross-ticker y exportación
+    # ---------------------------------------------------------------------------
+    ivl_calc = LatentAdvantageIndex(weights=cfg.ivl_weights)
+
+    # Recolectar todos los registros crudos de todos los tickers
+    all_raw_ivl = []
+    for tr in results_per_ticker.values():
+        all_raw_ivl.extend(tr.get("raw_ivl_records", []))
+
+    # Normalizar y calcular IVL (escala = std agrupado cross-ticker)
+    finalized_ivl = _finalize_ivl_records(all_raw_ivl, ivl_calc)
+
+    # Distribuir registros finalizados de vuelta a cada ticker y exportar
+    for tr in results_per_ticker.values():
+        t = tr["ticker"]
+        ticker_records = [r for r in finalized_ivl if r.get("ticker") == t]
+        tr["ivl_records"] = ticker_records
+        if ticker_records:
+            ticker_results_dir = Path(cfg.results_dir) / t
+            export_ivl_results(ticker_records, results_dir=ticker_results_dir)
+            _print_ivl_summary(t, ticker_records)
+
     cross_df = pd.DataFrame()
     if len(cfg.tickers) > 1:
         print("\n" + "=" * 120)

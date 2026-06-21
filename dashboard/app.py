@@ -12,6 +12,7 @@ La logica de datos y calculos no se modifica en este fichero.
 Solo se define el layout y los callbacks de actualizacion.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -25,6 +26,17 @@ import subprocess
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# parse_known_args: ignora argumentos internos de Dash/Werkzeug
+_cli_parser = argparse.ArgumentParser(add_help=False)
+_cli_parser.add_argument("--results-dir", default=None,
+                         help="Directorio de resultados (default: results/)")
+_cli_args, _ = _cli_parser.parse_known_args()
+
+if _cli_args.results_dir:
+    # Debe importarse antes de cualquier otro import de dashboard.data
+    from dashboard.data.loader import set_results_dir
+    set_results_dir(_cli_args.results_dir)
 
 from dashboard.data import (
     load_all_dashboard_data,
@@ -726,8 +738,10 @@ if __name__ == "__main__":
     print("Dashboard de Ventaja Latente")
     print("=" * 60)
 
+    from dashboard.data.loader import get_results_path
+    print(f"\nDirectorio de resultados: {get_results_path()}")
     if available_tickers:
-        print(f"\nTickers disponibles: {available_tickers}")
+        print(f"Tickers disponibles: {available_tickers}")
     print("\nhttp://127.0.0.1:8050")
     print("Ctrl+C para detener\n")
 

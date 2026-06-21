@@ -430,6 +430,94 @@ class TestFinancialEnv:
         assert info["equity"] > env.initial_balance
 
 
+class TestFinancialEnvFeatureCols:
+    """Tests para feature_cols y price_col (Parte 0 del spec)."""
+
+    @pytest.fixture
+    def rich_data(self):
+        """DataFrame con OHLCV + features adicionales."""
+        np.random.seed(0)
+        n = 20
+        return pd.DataFrame({
+            "open":  np.full(n, 100.0),
+            "high":  np.full(n, 105.0),
+            "low":   np.full(n, 95.0),
+            "close": np.linspace(100, 110, n),
+            "volume": np.full(n, 1000.0),
+            "rsi_14":       np.random.rand(n) * 100,
+            "log_return":   np.random.randn(n) * 0.01,
+        })
+
+    def test_observation_shape_with_feature_cols(self, rich_data):
+        """observation_space.shape debe ser (L, len(feature_cols)) cuando se especifican."""
+        L = 5
+        feature_cols = ["rsi_14", "log_return"]
+        env = FinancialEnv(rich_data, lookback_window=L, feature_cols=feature_cols)
+        assert env.observation_space.shape == (L, len(feature_cols))
+        obs, _ = env.reset()
+        assert obs.shape == (L, len(feature_cols))
+
+    def test_observation_excludes_ohlcv_when_feature_cols_given(self, rich_data):
+        """Con feature_cols, la obs NO incluye columnas OHLCV."""
+        L = 3
+        feature_cols = ["rsi_14"]
+        env = FinancialEnv(rich_data, lookback_window=L, feature_cols=feature_cols)
+        obs, _ = env.reset()
+        # La observación debe tener exactamente 1 columna (rsi_14)
+        assert obs.shape == (L, 1)
+        # Verificar que los valores de la obs corresponden a rsi_14
+        expected = rich_data["rsi_14"].values[0:L].reshape(L, 1)
+        assert np.allclose(obs, expected)
+
+    def test_price_col_used_for_execution(self, rich_data):
+        """El precio de ejecución refleja price_col, no el índice 3 hardcoded."""
+        env = FinancialEnv(
+            rich_data, lookback_window=3, price_col="close",
+            feature_cols=["rsi_14"]
+        )
+        env.reset()
+        _, _, _, _, info = env.step(0)
+        # El precio actual debe venir de close, que comienza en ~100 y sube a 110
+        assert 99.0 < info["current_price"] < 111.0
+
+    def test_auto_detects_non_ohlcv_features(self, rich_data):
+        """Sin feature_cols, el entorno usa automáticamente las columnas no-OHLCV."""
+        env = FinancialEnv(rich_data, lookback_window=3)
+        # rsi_14 y log_return son las únicas no-OHLCV
+        assert env.n_features == 2
+        assert env.observation_space.shape == (3, 2)
+
+    def test_price_col_fallback_when_missing(self):
+        """Si price_col no existe en el DataFrame, se usa el índice 3 como fallback."""
+        data = pd.DataFrame({
+            "Open": [100.0] * 10,
+            "High": [105.0] * 10,
+            "Low":  [95.0] * 10,
+            "Close": [102.0] * 10,
+            "Volume": [1000.0] * 10,
+        })
+        # price_col="close" (minúsculas) no existe → fallback a índice 3
+        env = FinancialEnv(data, lookback_window=2, price_col="close")
+        env.reset()
+        _, _, _, _, info = env.step(0)
+        # El precio debe ser Close (índice 3), que es 102.0
+        assert info["current_price"] == pytest.approx(102.0)
+
+    def test_column_order_irrelevant_for_equity(self, rich_data):
+        """El cálculo de equity no depende del orden de columnas, sólo de price_col."""
+        # Crear versión con columnas en orden diferente
+        cols_reversed = list(rich_data.columns[::-1])
+        data_reversed = rich_data[cols_reversed]
+
+        env = FinancialEnv(data_reversed, lookback_window=3,
+                           price_col="close", feature_cols=["rsi_14"])
+        env.reset()
+        env.step(1)  # buy
+        _, _, _, _, info = env.step(0)  # hold
+        # El precio debe seguir siendo close, independientemente del orden
+        assert 99.0 < info["current_price"] < 111.0
+
+
 class TestBaseFinancialEnv:
     """Tests para BaseFinancialEnv."""
 

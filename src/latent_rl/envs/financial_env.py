@@ -4,12 +4,20 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from latent_rl.envs.base import BaseFinancialEnv
+
+# Columnas OHLCV estándar (minúsculas)
+_OHLCV_COLS = {"open", "high", "low", "close", "volume"}
 
 
 class FinancialEnv(BaseFinancialEnv):
-    """Entorno financiero para trading algorítmico."""
+    """Entorno financiero para trading algorítmico.
+
+    La observación contiene únicamente las columnas de features (estacionarias,
+    normalizadas por la capa de datos).  El precio de ejecución se resuelve
+    por nombre de columna (``price_col``), no por índice fijo.
+    """
 
     def __init__(
         self,
@@ -17,63 +25,86 @@ class FinancialEnv(BaseFinancialEnv):
         initial_balance: float = 10000.0,
         transaction_cost: float = 0.001,
         lookback_window: int = 10,
-        render_mode: Optional[str] = None
+        render_mode: Optional[str] = None,
+        feature_cols: Optional[List[str]] = None,
+        price_col: str = "close",
     ):
         """
         Inicializa el entorno financiero.
 
         Args:
-            data: DataFrame con datos OHLCV
-            initial_balance: Balance inicial del agente
-            transaction_cost: Coste de transacción (porcentaje)
-            lookback_window: Ventana de observación histórica
-            render_mode: Modo de renderizado
+            data: DataFrame con datos OHLCV (+ features opcionales).
+            initial_balance: Balance inicial del agente.
+            transaction_cost: Coste de transacción (porcentaje).
+            lookback_window: Ventana de observación histórica.
+            render_mode: Modo de renderizado.
+            feature_cols: Columnas que forman la observación. Si None, usa
+                todas las columnas no-OHLCV; si no hay ninguna, usa OHLCV
+                completo (comportamiento heredado).
+            price_col: Columna de precio para ejecución/equity (default "close").
         """
-        # Validar datos
         if len(data) < lookback_window:
-            raise ValueError(f"Datos insuficientes: se necesitan al menos {lookback_window} filas")
+            raise ValueError(
+                f"Datos insuficientes: se necesitan al menos {lookback_window} filas"
+            )
 
         self.data = data.values
-        self.n_features = data.shape[1]
         self.initial_balance = initial_balance
         self.transaction_cost = transaction_cost
         self.lookback_window = lookback_window
 
-        # Espacio de observaciones: ventana histórica de features
+        # --- Resolver índice de precio -------------------------------------------
+        if price_col in data.columns:
+            self._price_idx = data.columns.get_loc(price_col)
+        else:
+            # Fallback: índice 3 (posición clásica de Close en OHLCV)
+            self._price_idx = 3
+
+        # --- Resolver índices de features ----------------------------------------
+        if feature_cols is not None:
+            self._feature_idx = [data.columns.get_loc(c) for c in feature_cols]
+        else:
+            # Usar columnas no-OHLCV si existen, sino todas
+            non_ohlcv = [
+                c for c in data.columns if c.lower() not in _OHLCV_COLS
+            ]
+            if non_ohlcv:
+                self._feature_idx = [data.columns.get_loc(c) for c in non_ohlcv]
+            else:
+                self._feature_idx = list(range(data.shape[1]))
+
+        self.n_features = len(self._feature_idx)
+
         obs_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
             shape=(lookback_window, self.n_features),
-            dtype=np.float32
+            dtype=np.float32,
         )
-
-        # Espacio de acciones: 0=hold, 1=buy, 2=sell
         action_space = spaces.Discrete(3)
 
-        super().__init__(observation_space=obs_space, action_space=action_space, render_mode=render_mode)
+        super().__init__(
+            observation_space=obs_space,
+            action_space=action_space,
+            render_mode=render_mode,
+        )
 
         # Estado interno
         self.current_step = 0
         self.cash = initial_balance
         self.position_units = 0.0
-        self.position = 0  # 0=flat, 1=long
+        self.position = 0
         self.entry_price = 0.0
-        self.realized_profit = 0.0  # Acumulado de profit/pérdida de trades cerrados
-        self._cash_at_last_buy = 0.0  # Cash invertido en el último buy (para calcular profit del trade)
-        self.trade_history = []
+        self.realized_profit = 0.0
+        self._cash_at_last_buy = 0.0
+        self.trade_history: List[Dict] = []
         self.previous_equity = initial_balance
 
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
-        """
-        Resetea el entorno al estado inicial.
-
-        Args:
-            seed: Semilla aleatoria
-            options: Opciones adicionales
-
-        Returns:
-            tuple: (observation, info)
-        """
         if seed is not None:
             np.random.seed(seed)
 
@@ -87,208 +118,121 @@ class FinancialEnv(BaseFinancialEnv):
         self.trade_history = []
         self.previous_equity = self.initial_balance
 
-        obs = self._get_observation()
-        info = self._get_info()
-
-        return obs, info
+        return self._get_observation(), self._get_info()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """
-        Ejecuta un paso del entorno.
-
-        Args:
-            action: Acción a ejecutar (0=hold, 1=buy, 2=sell)
-
-        Returns:
-            tuple: (observation, reward, terminated, truncated, info)
-        """
-        # Validar acción
         if not self.action_space.contains(action):
             raise ValueError(f"Acción inválida: {action}")
 
-        # Obtener precio actual
-        current_price = self.data[self.current_step, 3]  # Columna Close
-
-        # Ejecutar acción y calcular recompensa
+        current_price = self._current_price()
         reward = self._execute_action(action, current_price)
 
-        # Avanzar paso
         self.current_step += 1
-
-        # Verificar condiciones de terminación
         terminated = self.current_step >= len(self.data) - 1
         truncated = False
 
-        # Obtener nueva observación e info
-        obs = self._get_observation()
-        info = self._get_info()
+        return self._get_observation(), reward, terminated, truncated, self._get_info()
 
-        return obs, reward, terminated, truncated, info
+    # ------------------------------------------------------------------
+    # Internos
+    # ------------------------------------------------------------------
+
+    def _current_price(self) -> float:
+        idx = min(self.current_step, len(self.data) - 1)
+        return float(self.data[idx, self._price_idx])
 
     def _get_equity(self) -> float:
-        """
-        Calcula el equity total (cash + valor de posición).
-
-        Returns:
-            Equity total de la cuenta
-        """
-        current_price = self.data[self.current_step, 3] if self.current_step < len(self.data) else self.data[-1, 3]
-
-        if self.position == 0:
-            return self.cash
-        elif self.position == 1:  # Long
-            position_value = self.position_units * current_price
-            return self.cash + position_value
-        else:  # Short (no implementado)
-            return self.cash
+        price = self._current_price()
+        if self.position == 1:
+            return self.cash + self.position_units * price
+        return self.cash
 
     def _get_observation(self) -> np.ndarray:
-        """Obtiene la observación actual (ventana histórica)."""
         start_idx = max(0, self.current_step - self.lookback_window)
         end_idx = self.current_step
+        window = self.data[start_idx:end_idx][:, self._feature_idx]
 
-        window = self.data[start_idx:end_idx]
-
-        # Si la ventana es más pequeña que lookback_window, pad con ceros
         if len(window) < self.lookback_window:
-            padding = np.zeros((self.lookback_window - len(window), self.n_features))
+            padding = np.zeros(
+                (self.lookback_window - len(window), self.n_features)
+            )
             window = np.vstack([padding, window])
 
         return window.astype(np.float32)
 
     def _get_info(self) -> Dict[str, Any]:
-        """Obtiene información adicional del estado actual."""
-        current_price = self.data[self.current_step, 3] if self.current_step < len(self.data) else self.data[-1, 3]
+        price = self._current_price()
         equity = self._get_equity()
-
         return {
-            "balance": self.cash,  # Mantenido por compatibilidad, ahora es cash
+            "balance": self.cash,
             "cash": self.cash,
             "equity": equity,
             "portfolio_value": equity,
             "position": self.position,
             "position_units": self.position_units,
-            "current_price": current_price,
+            "current_price": price,
             "entry_price": self.entry_price,
-            "realized_profit": self.realized_profit,  # Profit/pérdida realizada
-            "total_profit": self.realized_profit,  # Alias temporal por compatibilidad
+            "realized_profit": self.realized_profit,
+            "total_profit": self.realized_profit,
             "current_step": self.current_step,
-            "n_trades": len(self.trade_history)
+            "n_trades": len(self.trade_history),
         }
 
     def _execute_action(self, action: int, current_price: float) -> float:
-        """
-        Ejecuta una acción y calcula la recompensa.
-
-        Args:
-            action: Acción a ejecutar
-            current_price: Precio actual
-
-        Returns:
-            Recompensa obtenida (cambio de equity normalizado)
-        """
         current_equity = self._get_equity()
 
-        # Acción 0: Hold
-        if action == 0:
-            # Mantener posición actual, no se modifica nada
-            pass
-
-        # Acción 1: Buy
-        elif action == 1:
+        if action == 1:  # Buy
             if self.position == 0:
-                # Abrir posición long: invertir todo el cash disponible
-                self._cash_at_last_buy = self.cash  # guardar cash antes de invertir
+                self._cash_at_last_buy = self.cash
                 cost = self.cash * self.transaction_cost
-                cash_after_cost = self.cash - cost
-                self.position_units = cash_after_cost / current_price
+                self.position_units = (self.cash - cost) / current_price
                 self.cash = 0.0
                 self.position = 1
                 self.entry_price = current_price
+                self.trade_history.append(
+                    {"type": "buy", "price": current_price,
+                     "units": self.position_units, "step": self.current_step}
+                )
 
-                # Registrar trade
-                self.trade_history.append({
-                    "type": "buy",
-                    "price": current_price,
-                    "units": self.position_units,
-                    "step": self.current_step
-                })
-
-            elif self.position == 1:
-                # Ya tenemos posición long, mantener (hold)
-                pass
-
-        # Acción 2: Sell
-        elif action == 2:
+        elif action == 2:  # Sell
             if self.position == 1:
-                # Cerrar posición long
                 proceeds = self.position_units * current_price
                 cost = proceeds * self.transaction_cost
                 self.cash = proceeds - cost
-
-                # Acumular profit realizado de este trade
-                trade_profit = self.cash - self._cash_at_last_buy
-                self.realized_profit += trade_profit
+                self.realized_profit += self.cash - self._cash_at_last_buy
                 self._cash_at_last_buy = 0.0
-
-                # Registrar trade
-                self.trade_history.append({
-                    "type": "sell",
-                    "price": current_price,
-                    "units": self.position_units,
-                    "step": self.current_step
-                })
-
-                # Resetear posición
+                self.trade_history.append(
+                    {"type": "sell", "price": current_price,
+                     "units": self.position_units, "step": self.current_step}
+                )
                 self.position_units = 0.0
                 self.position = 0
                 self.entry_price = 0.0
 
-            elif self.position == 0:
-                # No hay posición, mantener (hold)
-                pass
-
-        # Calcular reward basado en cambio de equity
         new_equity = self._get_equity()
-        if self.previous_equity > 0:
-            reward = (new_equity - self.previous_equity) / self.initial_balance
-        else:
-            reward = 0.0
-
-        # Actualizar equity anterior para siguiente paso
+        reward = (
+            (new_equity - self.previous_equity) / self.initial_balance
+            if self.previous_equity > 0
+            else 0.0
+        )
         self.previous_equity = new_equity
-
         return reward
 
     def _calculate_pnl(self, current_price: float) -> float:
-        """
-        Calcula el profit/loss de la posición actual.
-
-        Args:
-            current_price: Precio actual
-
-        Returns:
-            Profit/loss calculado
-        """
-        if self.position == 0:
-            return 0.0
-
-        if self.position == 1:  # Long
+        if self.position == 1:
             return (current_price - self.entry_price) * self.position_units
-        else:  # Short (no implementado)
-            return 0.0
+        return 0.0
 
     def render(self):
-        """Renderiza el entorno (no implementado en MVP)."""
         if self.render_mode is None:
             return None
-
-        # En MVP, simplemente imprimir estado
         info = self._get_info()
-        print(f"Step: {info['current_step']}, Cash: ${info['cash']:.2f}, "
-              f"Equity: ${info['equity']:.2f}, Position: {info['position']}, "
-              f"Units: {info['position_units']:.4f}, Total Profit: ${info['total_profit']:.2f}")
+        print(
+            f"Step: {info['current_step']}, Cash: ${info['cash']:.2f}, "
+            f"Equity: ${info['equity']:.2f}, Position: {info['position']}, "
+            f"Units: {info['position_units']:.4f}, "
+            f"Total Profit: ${info['total_profit']:.2f}"
+        )
 
     def close(self):
-        """Cierra el entorno."""
         pass

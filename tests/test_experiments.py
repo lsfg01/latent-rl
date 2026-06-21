@@ -41,9 +41,11 @@ def _minimal_ohlcv() -> pd.DataFrame:
     })
 
 
-def _ivl_record(latent_agent: str = "LatentDQN", ivl: float = 0.3) -> dict:
+def _ivl_record(latent_agent: str = "LatentDQN", ivl: float = 0.3,
+                ticker: str = "SPY") -> dict:
     """Registro IVL minimo para tests de agregacion."""
     return {
+        "ticker":           ticker,
         "direct_agent":     "DQNAgent",
         "latent_agent":     latent_agent,
         "ivl":              ivl,
@@ -171,8 +173,8 @@ class TestAggregateTickerResults:
 
     def test_multi_ticker_includes_mean_and_std_rows(self):
         results = {
-            "SPY":  {"ivl_records": [_ivl_record("LatentDQN", 0.3)]},
-            "AAPL": {"ivl_records": [_ivl_record("LatentDQN", 0.1)]},
+            "SPY":  {"ivl_records": [_ivl_record("LatentDQN", 0.3, ticker="SPY")]},
+            "AAPL": {"ivl_records": [_ivl_record("LatentDQN", 0.1, ticker="AAPL")]},
         }
         cfg = ExperimentConfig(tickers=["SPY", "AAPL"])
         df = aggregate_ticker_results(results, cfg)
@@ -181,8 +183,8 @@ class TestAggregateTickerResults:
 
     def test_mean_row_is_average_of_tickers(self):
         results = {
-            "SPY":  {"ivl_records": [_ivl_record("LatentDQN", 0.4)]},
-            "AAPL": {"ivl_records": [_ivl_record("LatentDQN", 0.2)]},
+            "SPY":  {"ivl_records": [_ivl_record("LatentDQN", 0.4, ticker="SPY")]},
+            "AAPL": {"ivl_records": [_ivl_record("LatentDQN", 0.2, ticker="AAPL")]},
         }
         cfg = ExperimentConfig(tickers=["SPY", "AAPL"])
         df = aggregate_ticker_results(results, cfg)
