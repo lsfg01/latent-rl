@@ -46,13 +46,17 @@ from dashboard.data import (
 from dashboard.components import (
     create_kpi_card,
     create_ivl_card,
-    create_ivl_kpi_card,
     create_delta_card,
-    create_agent_return_bar,
-    create_seed_return_boxplot,
-    create_seed_return_scatter,
+    create_agent_metric_bar,
+    create_seed_metric_boxplot,
+    create_seed_metric_scatter,
     create_ivl_delta_bar,
     create_cross_ticker_ivl_chart,
+)
+from latent_rl.reporting.agent_metadata import (
+    AGENT_DESCRIPTIONS,
+    AGENT_DISPLAY,
+    agent_display_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -204,12 +208,16 @@ agent_summary_df,      agent_summary_error      = raw_dashboard_data["agent_summ
 agent_seed_metrics_df, agent_seed_metrics_error  = raw_dashboard_data["agent_seed_metrics"]
 ivl_results_df,        ivl_results_error         = raw_dashboard_data["ivl_results"]
 ticker_comparison_df,  ticker_comparison_error    = raw_dashboard_data["ticker_comparison"]
+validation_metrics_df, validation_metrics_error   = raw_dashboard_data["validation_metrics"]
+experiment_config,     experiment_config_error     = raw_dashboard_data["experiment_config"]
 
 dashboard_data_serializable = {
     "agent_summary":      dataframe_to_records(agent_summary_df),
     "agent_seed_metrics": dataframe_to_records(agent_seed_metrics_df),
     "ivl_results":        dataframe_to_records(ivl_results_df),
     "ticker_comparison":  dataframe_to_records(ticker_comparison_df),
+    "validation_metrics": dataframe_to_records(validation_metrics_df),
+    "experiment_config":  experiment_config,
 }
 
 missing_files = {k: v for k, v in {
@@ -255,13 +263,21 @@ else:
 kpi_data = {}
 if agent_summary_df is not None and not agent_summary_df.empty:
     kpi_data["num_agents"]  = len(agent_summary_df)
-    kpi_data["best_agent"]  = agent_summary_df.loc[
-        agent_summary_df[RETURN_COL].idxmax(), AGENT_COL]
-    kpi_data["best_return"] = agent_summary_df[RETURN_COL].max()
+    best_metric_col = (
+        "mean_sharpe_oos" if "mean_sharpe_oos" in agent_summary_df.columns
+        else RETURN_COL
+    )
+    kpi_data["best_agent"] = agent_display_name(agent_summary_df.loc[
+        agent_summary_df[best_metric_col].idxmax(), AGENT_COL])
+    kpi_data["best_metric"] = agent_summary_df[best_metric_col].max()
+    kpi_data["best_metric_label"] = (
+        "Sharpe OOS" if best_metric_col == "mean_sharpe_oos" else "Retorno"
+    )
 else:
     kpi_data["num_agents"]  = 0
     kpi_data["best_agent"]  = "N/A"
-    kpi_data["best_return"] = 0.0
+    kpi_data["best_metric"] = 0.0
+    kpi_data["best_metric_label"] = "Sharpe OOS"
 
 if agent_seed_metrics_df is not None and not agent_seed_metrics_df.empty:
     kpi_data["num_seeds"] = agent_seed_metrics_df["seed"].nunique()
@@ -269,11 +285,12 @@ else:
     kpi_data["num_seeds"] = 0
 
 if ivl_results_df is not None and not ivl_results_df.empty:
-    kpi_data["ivl_value"]          = ivl_results_df.iloc[0]["ivl"]
-    kpi_data["ivl_interpretation"] = ivl_results_df.iloc[0]["interpretation"]
+    best_ivl_row = ivl_results_df.loc[ivl_results_df["ivl"].idxmax()]
+    kpi_data["ivl_value"] = best_ivl_row["ivl"]
+    kpi_data["ivl_agent"] = agent_display_name(best_ivl_row.get("latent_agent"))
 else:
     kpi_data["ivl_value"]          = 0.0
-    kpi_data["ivl_interpretation"] = "N/A"
+    kpi_data["ivl_agent"]          = "N/A"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +337,36 @@ def _ticker_selector_row():
     ], className="ticker-selector-row", style=style)
 
 
+def _agent_experiment_details():
+    """Banner informativo compartido por cualquier run A/B/C/D."""
+    return html.Details([
+        html.Summary("¿Qué compara este experimento?"),
+        html.P(
+            "A es el baseline directo; B, C y D son variantes LatentDQN que "
+            "difieren en cómo se obtiene y entrena su representación."
+        ),
+        html.Ul([
+            html.Li([html.Strong(f"{AGENT_DISPLAY[agent]}: "),
+                     AGENT_DESCRIPTIONS[agent]])
+            for agent in ("A", "B", "C", "D")
+        ]),
+    ], className="experiment-details")
+
+
+def _metric_selector(selector_id, options, value, label="Métrica:"):
+    return html.Div([
+        html.Span(label, className="ticker-selector-label"),
+        dcc.Dropdown(
+            id=selector_id,
+            options=[{"label": option_label, "value": option_value}
+                     for option_label, option_value in options],
+            value=value,
+            clearable=False,
+            style={"minWidth": "240px", "fontSize": "14px"},
+        ),
+    ], className="inline-selector")
+
+
 def _control_panel():
     """Panel de control compacto en una sola fila."""
     return html.Div([
@@ -361,12 +408,22 @@ def _kpi_row():
     return html.Div([
         create_kpi_card("Agentes comparados", str(kpi_data["num_agents"])),
         create_kpi_card("Semillas", str(kpi_data["num_seeds"])),
-        create_kpi_card(
-            "Mejor agente (OOS)" if RETURN_COL and "oos" in RETURN_COL else "Mejor agente",
-            kpi_data["best_agent"],
-            f"Retorno: {kpi_data['best_return']:+.4f}",
+        html.Div(
+            create_kpi_card(
+                "Mejor agente (OOS)" if RETURN_COL and "oos" in RETURN_COL else "Mejor agente",
+                kpi_data["best_agent"],
+                f"{kpi_data['best_metric_label']}: {kpi_data['best_metric']:+.4f}",
+            ),
+            id="best-agent-kpi-container",
         ),
-        create_ivl_kpi_card(kpi_data["ivl_value"], kpi_data["ivl_interpretation"]),
+        html.Div(
+            create_kpi_card(
+                "Mejor latente por IVL",
+                kpi_data["ivl_agent"],
+                f"IVL: {kpi_data['ivl_value']:+.4f}",
+            ),
+            id="ivl-kpi-container",
+        ),
     ], className="kpi-grid", style={"marginBottom": "16px"})
 
 
@@ -402,6 +459,7 @@ def create_layout():
             # Control + alertas
             _control_panel(),
             _missing_files_alert(),
+            _agent_experiment_details(),
 
             # KPIs
             _kpi_row(),
@@ -412,13 +470,22 @@ def create_layout():
             # ── Seccion IVL ─────────────────────────────────────────────────
             _section("Indice de Ventaja Latente (IVL)",
 
+                _metric_selector(
+                    "latent-agent-selector",
+                    [
+                        ("Todos", "ALL"),
+                        (AGENT_DISPLAY["B"], "B"),
+                        (AGENT_DISPLAY["C"], "C"),
+                        (AGENT_DISPLAY["D"], "D"),
+                    ],
+                    "ALL",
+                    label="Agente latente:",
+                ),
+
                 # Valor + badge (layout horizontal)
                 html.Div([
                     html.Div([
-                        create_ivl_card(
-                            kpi_data["ivl_value"],
-                            kpi_data["ivl_interpretation"],
-                        ),
+                        html.Div(id="ivl-overview-card"),
                     ], style={"minWidth": "180px"}),
 
                     html.Div([
@@ -427,6 +494,8 @@ def create_layout():
                         html.Div(id="ivl-delta-cards"),
                     ], style={"flex": "1"}),
                 ], className="ivl-card"),
+
+                html.Div(id="ivl-summary-table", className="table-container"),
 
                 # Grafica de deltas
                 html.Div(id="ivl-delta-chart", className="graph-container"),
@@ -440,12 +509,35 @@ def create_layout():
                     "Permite evaluar si la ventaja latente es consistente entre mercados.",
                     className="cross-ticker-note",
                 ),
+                dcc.RadioItems(
+                    id="cross-ticker-view-selector",
+                    options=[
+                        {"label": " Barras", "value": "bars"},
+                        {"label": " Heatmap", "value": "heatmap"},
+                    ],
+                    value="bars",
+                    inline=True,
+                    className="view-selector",
+                ),
                 html.Div(id="cross-ticker-chart", className="graph-container"),
+                html.Div(id="cross-ticker-summary-table", className="table-container"),
             ], className="section",
                style={} if show_cross_ticker else {"display": "none"}),
 
             # ── Comparacion de agentes ───────────────────────────────────────
             _section("Comparacion de Agentes",
+                _metric_selector(
+                    "agent-metric-selector",
+                    [
+                        ("Sharpe OOS", "mean_sharpe_oos"),
+                        ("Retorno OOS", "mean_return_oos"),
+                        ("Max Drawdown OOS", "mean_mdd_oos"),
+                        ("Gap Sharpe IS/OOS", "sharpe_gap"),
+                        ("Nº trades medio", "mean_n_trades"),
+                        ("Equity final OOS", "mean_equity_oos"),
+                    ],
+                    "mean_sharpe_oos",
+                ),
                 html.Div([
                     html.Div(id="agent-comparison-chart", className="graph-container"),
                     html.Div(id="agent-summary-table",    className="table-container"),
@@ -454,15 +546,33 @@ def create_layout():
 
             # ── Metricas por semilla ─────────────────────────────────────────
             _section("Metricas por Semilla",
+                _metric_selector(
+                    "seed-metric-selector",
+                    [
+                        ("Sharpe OOS", "sharpe"),
+                        ("Retorno total OOS", "total_return"),
+                    ],
+                    "sharpe",
+                ),
                 html.Div([
                     html.Div(id="seed-boxplot-chart", className="graph-container"),
                     html.Div(id="seed-scatter-chart", className="graph-container"),
                 ], className="chart-grid"),
             ),
 
+            html.Details([
+                html.Summary("Validación interna"),
+                html.P(
+                    "Trazabilidad del checkpoint seleccionado en el tramo de validación.",
+                    className="cross-ticker-note",
+                ),
+                html.Div(id="validation-summary-table", className="table-container"),
+            ], className="section collapsible-section"),
+
             # ── Notas metodologicas ──────────────────────────────────────────
             _section("Notas Metodologicas",
                 html.Div([
+                    html.Div(id="methodology-config"),
                     html.H3("Glosario de columnas"),
                     html.Table([
                         html.Thead(html.Tr([
@@ -487,10 +597,9 @@ def create_layout():
                     ], style={"borderCollapse": "collapse", "width": "100%", "marginBottom": "24px",
                               "fontSize": "13px", "lineHeight": "1.6"}),
 
-                    html.H3("Limitaciones del experimento", style={"marginTop": "8px"}),
+                    html.H3("Limitaciones de interpretación", style={"marginTop": "8px"}),
                     html.Ul([
                         html.Li("Dashboard exploratorio — no prueba superioridad estadistica."),
-                        html.Li("Entrenamiento corto (10 episodios) con datos reales de Yahoo Finance."),
                         html.Li("El IVL es una metrica agregada; analizar cada componente por separado."),
                         html.Li("El split IS/OOS es temporal: IS precede siempre a OOS."),
                         html.Li("Resultados pasados no garantizan resultados futuros."),
@@ -558,6 +667,8 @@ def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, curre
                     "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                     "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
                     "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
+                    "validation_metrics": dataframe_to_records(raw["validation_metrics"][0]),
+                    "experiment_config":  raw["experiment_config"][0],
                 }
                 return (new_data,
                         html.Div("Datos generados y cargados correctamente",
@@ -585,6 +696,8 @@ def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, curre
                 "agent_seed_metrics": dataframe_to_records(raw["agent_seed_metrics"][0]),
                 "ivl_results":        dataframe_to_records(raw["ivl_results"][0]),
                 "ticker_comparison":  dataframe_to_records(raw["ticker_comparison"][0]),
+                "validation_metrics": dataframe_to_records(raw["validation_metrics"][0]),
+                "experiment_config":  raw["experiment_config"][0],
             }
             if button_id == "ticker-selector":
                 label = f"Datos cargados para ticker: {selected_ticker or 'auto'}"
@@ -604,63 +717,151 @@ def update_dashboard_data(generate_clicks, reload_clicks, selected_ticker, curre
 
 
 @app.callback(
-    Output("ivl-delta-cards", "children"),
-    Output("ivl-delta-chart",  "children"),
-    Input("dashboard-data",    "data"),
+    Output("ivl-kpi-container", "children"),
+    Output("ivl-overview-card", "children"),
+    Output("ivl-summary-table", "children"),
+    Output("ivl-delta-cards",   "children"),
+    Output("ivl-delta-chart",   "children"),
+    Input("dashboard-data",     "data"),
+    Input("latent-agent-selector", "value"),
 )
-def update_ivl_section(data):
+def update_ivl_section(data, selected_latent="ALL"):
     try:
-        ivl_df = records_to_dataframe(data.get("ivl_results"))
+        ivl_df = records_to_dataframe((data or {}).get("ivl_results"))
         if ivl_df is None or ivl_df.empty:
             empty = html.Div("No hay datos de IVL disponibles",
                              style={"color": "#718096", "fontSize": "0.9em"})
-            return empty, empty
+            return empty, empty, empty, empty, empty
 
-        row = ivl_df.iloc[0]
+        if "latent_agent" not in ivl_df.columns:
+            ivl_df["latent_agent"] = "LatentDQNAgent"
+        best_row = ivl_df.loc[ivl_df["ivl"].idxmax()]
+        selected_df = (
+            ivl_df if selected_latent in (None, "ALL")
+            else ivl_df[ivl_df["latent_agent"] == selected_latent]
+        )
+        if selected_df.empty:
+            selected_df = ivl_df
+        detail_row = (
+            best_row if selected_latent in (None, "ALL") else selected_df.iloc[0]
+        )
+
+        best_agent = agent_display_name(best_row["latent_agent"])
+        ivl_kpi = create_kpi_card(
+            "Mejor latente por IVL",
+            best_agent,
+            f"IVL: {float(best_row['ivl']):+.4f}",
+        )
+        overview = html.Div([
+            create_ivl_card(
+                float(detail_row["ivl"]),
+                str(detail_row.get("interpretation", "neutral")),
+            ),
+            html.Div(
+                ("Mejor del ticker: " if selected_latent in (None, "ALL")
+                 else "Agente seleccionado: ")
+                + agent_display_name(detail_row["latent_agent"]),
+                className="ivl-selection-note",
+            ),
+        ])
+
+        interpretation_labels = {
+            "latent_advantage": "Ventaja latente",
+            "direct_advantage": "Ventaja directa",
+            "neutral": "Neutral",
+        }
+        table_df = ivl_df[[
+            "latent_agent", "ivl", "interpretation", "delta_sharpe",
+            "delta_mdd", "delta_seed_std", "delta_is_oos_gap",
+        ]].copy()
+        table_df["latent_agent"] = table_df["latent_agent"].map(agent_display_name)
+        table_df["interpretation"] = table_df["interpretation"].map(
+            lambda value: interpretation_labels.get(str(value), str(value))
+        )
+        numeric_columns = [
+            "ivl", "delta_sharpe", "delta_mdd", "delta_seed_std",
+            "delta_is_oos_gap",
+        ]
+        table_df[numeric_columns] = table_df[numeric_columns].round(4)
+        table_df.columns = [
+            "Agente latente", "IVL", "Interpretación", "ΔSharpe", "ΔMDD",
+            "ΔSeedStd", "ΔGap IS/OOS",
+        ]
+        table = dash_table.DataTable(
+            data=table_df.to_dict("records"),
+            columns=[{"name": column, "id": column} for column in table_df.columns],
+            style_table={"overflowX": "auto", "fontSize": "12px"},
+            style_header=TABLE_HEADER_STYLE,
+            style_cell=TABLE_CELL_STYLE,
+            style_data_conditional=TABLE_CELL_COND,
+        )
+
         delta_cards = html.Div([
-            create_delta_card("Delta Sharpe",    row["delta_sharpe"],    is_better_positive=True),
-            create_delta_card("Delta MDD",       row["delta_mdd"],       is_better_positive=False),
-            create_delta_card("Delta Seed Std",  row["delta_seed_std"],  is_better_positive=False),
-            create_delta_card("Delta IS/OOS Gap",row["delta_is_oos_gap"],is_better_positive=False),
+            create_delta_card("Delta Sharpe",    detail_row["delta_sharpe"],    is_better_positive=True),
+            create_delta_card("Delta MDD",       detail_row["delta_mdd"],       is_better_positive=False),
+            create_delta_card("Delta Seed Std",  detail_row["delta_seed_std"],  is_better_positive=False),
+            create_delta_card("Delta IS/OOS Gap",detail_row["delta_is_oos_gap"],is_better_positive=False),
         ], className="delta-grid")
 
         delta_chart = dcc.Graph(
-            figure=create_ivl_delta_bar(ivl_df),
+            figure=create_ivl_delta_bar(selected_df),
             config={"displayModeBar": False},
         )
-        return delta_cards, delta_chart
+        return ivl_kpi, overview, table, delta_cards, delta_chart
     except Exception as exc:
         err = html.Div(f"Error IVL: {exc}", style={"color": "#c53030"})
-        return err, err
+        return err, err, err, err, err
 
 
 @app.callback(
     Output("cross-ticker-chart", "children"),
+    Output("cross-ticker-summary-table", "children"),
     Input("dashboard-data",      "data"),
+    Input("cross-ticker-view-selector", "value"),
 )
-def update_cross_ticker(data):
+def update_cross_ticker(data, view="bars"):
     try:
-        ct_df = records_to_dataframe(data.get("ticker_comparison"))
+        ct_df = records_to_dataframe((data or {}).get("ticker_comparison"))
         if ct_df is None or ct_df.empty:
-            return html.Div(
+            empty = html.Div(
                 "Sin datos cross-ticker. Ejecuta el experimento con varios tickers.",
                 style={"color": "#718096", "fontSize": "0.9em"},
             )
+            return empty, html.Div()
         chart = dcc.Graph(
-            figure=create_cross_ticker_ivl_chart(ct_df),
+            figure=create_cross_ticker_ivl_chart(ct_df, view=view),
             config={"displayModeBar": False},
         )
-        return chart
+        detail = ct_df[
+            ~ct_df["ticker"].astype(str).str.upper().isin(["MEAN", "STD"])
+        ].drop_duplicates(subset=["ticker", "latent_agent"], keep="last")
+        stats = detail.groupby("latent_agent")["ivl"].agg(["mean", "std"]).reset_index()
+        stats["Agente latente"] = stats["latent_agent"].map(agent_display_name)
+        stats["IVL medio"] = stats["mean"].round(4)
+        stats["IVL std."] = stats["std"].fillna(0).round(4)
+        stats = stats[["Agente latente", "IVL medio", "IVL std."]]
+        table = dash_table.DataTable(
+            data=stats.to_dict("records"),
+            columns=[{"name": column, "id": column} for column in stats.columns],
+            style_table={"overflowX": "auto", "fontSize": "12px"},
+            style_header=TABLE_HEADER_STYLE,
+            style_cell=TABLE_CELL_STYLE,
+            style_data_conditional=TABLE_CELL_COND,
+        )
+        return chart, table
     except Exception as exc:
-        return html.Div(f"Error cross-ticker: {exc}", style={"color": "#c53030"})
+        err = html.Div(f"Error cross-ticker: {exc}", style={"color": "#c53030"})
+        return err, err
 
 
 @app.callback(
+    Output("best-agent-kpi-container", "children"),
     Output("agent-comparison-chart", "children"),
     Output("agent-summary-table",    "children"),
     Input("dashboard-data",          "data"),
+    Input("agent-metric-selector",   "value"),
 )
-def update_agent_comparison(data):
+def update_agent_comparison(data, selected_metric="mean_sharpe_oos"):
     try:
         summary_records = data.get("agent_summary")
         summary_df = records_to_dataframe(summary_records)
@@ -668,10 +869,22 @@ def update_agent_comparison(data):
         if summary_df is None or summary_df.empty:
             msg = html.Div("No hay datos de agentes disponibles",
                            style={"color": "#718096"})
-            return msg, msg
+            return msg, msg, msg
+
+        best_col = (
+            "mean_sharpe_oos" if "mean_sharpe_oos" in summary_df.columns
+            else selected_metric
+        )
+        best_row = summary_df.loc[summary_df[best_col].idxmax()]
+        best_label = "Sharpe OOS" if best_col == "mean_sharpe_oos" else best_col
+        best_kpi = create_kpi_card(
+            "Mejor agente (OOS)",
+            agent_display_name(best_row.get("agent_name", best_row.get("agent"))),
+            f"{best_label}: {float(best_row[best_col]):+.4f}",
+        )
 
         chart = dcc.Graph(
-            figure=create_agent_return_bar(summary_df),
+            figure=create_agent_metric_bar(summary_df, selected_metric),
             config={"displayModeBar": False},
         )
 
@@ -691,9 +904,23 @@ def update_agent_comparison(data):
             "mean_n_trades":     "Nº trades medio",
             "seed_std_return_is":"Desv. entre semillas IS",
         }
-        display_cols = [c for c in summary_df.columns if c not in ("seed",)]
+        table_df = summary_df.copy()
+        if "agent_name" in table_df.columns:
+            table_df.insert(
+                0, "agent_display", table_df["agent_name"].map(agent_display_name)
+            )
+        if {"mean_sharpe_is", "mean_sharpe_oos"}.issubset(table_df.columns):
+            table_df["sharpe_gap"] = (
+                table_df["mean_sharpe_is"] - table_df["mean_sharpe_oos"]
+            ).abs()
+        COL_LABELS["agent_display"] = "Agente"
+        COL_LABELS["sharpe_gap"] = "Gap Sharpe IS/OOS"
+        display_cols = [
+            c for c in table_df.columns
+            if c not in ("seed", "agent_name")
+        ]
         table = dash_table.DataTable(
-            data=summary_records or [],
+            data=table_df[display_cols].round(4).to_dict("records"),
             columns=[{"name": COL_LABELS.get(c, c), "id": c} for c in display_cols],
             style_table={"overflowX": "auto", "fontSize": "12px"},
             style_header=TABLE_HEADER_STYLE,
@@ -701,18 +928,19 @@ def update_agent_comparison(data):
             style_data_conditional=TABLE_CELL_COND,
             page_size=10,
         )
-        return chart, table
+        return best_kpi, chart, table
     except Exception as exc:
         err = html.Div(f"Error comparacion: {exc}", style={"color": "#c53030"})
-        return err, err
+        return err, err, err
 
 
 @app.callback(
     Output("seed-boxplot-chart", "children"),
     Output("seed-scatter-chart", "children"),
     Input("dashboard-data",      "data"),
+    Input("seed-metric-selector", "value"),
 )
-def update_seed_metrics(data):
+def update_seed_metrics(data, selected_metric="sharpe"):
     try:
         seed_df = records_to_dataframe(data.get("agent_seed_metrics"))
         if seed_df is None or seed_df.empty:
@@ -720,14 +948,115 @@ def update_seed_metrics(data):
                            style={"color": "#718096"})
             return msg, msg
 
-        boxplot = dcc.Graph(figure=create_seed_return_boxplot(seed_df),
+        boxplot = dcc.Graph(figure=create_seed_metric_boxplot(seed_df, selected_metric),
                             config={"displayModeBar": False})
-        scatter = dcc.Graph(figure=create_seed_return_scatter(seed_df),
+        scatter = dcc.Graph(figure=create_seed_metric_scatter(seed_df, selected_metric),
                             config={"displayModeBar": False})
         return boxplot, scatter
     except Exception as exc:
         err = html.Div(f"Error metricas por semilla: {exc}", style={"color": "#c53030"})
         return err, err
+
+
+@app.callback(
+    Output("validation-summary-table", "children"),
+    Input("dashboard-data", "data"),
+)
+def update_validation_summary(data):
+    """Resume la seleccion de checkpoints sin convertirla en narrativa principal."""
+    try:
+        validation_df = records_to_dataframe((data or {}).get("validation_metrics"))
+        if validation_df is None or validation_df.empty:
+            return html.Div(
+                "Esta run no contiene validation_metrics.csv.",
+                style={"color": "#718096", "fontSize": "0.9em"},
+            )
+        required = [
+            "agent_name", "best_val_episode", "best_val_score",
+            "best_val_sharpe", "best_val_mdd",
+        ]
+        missing = [column for column in required if column not in validation_df.columns]
+        if missing:
+            return html.Div(
+                f"Validación disponible, pero faltan columnas: {missing}",
+                style={"color": "#718096", "fontSize": "0.9em"},
+            )
+        summary = validation_df.groupby("agent_name", as_index=False)[required[1:]].mean()
+        summary.insert(0, "Agente", summary["agent_name"].map(agent_display_name))
+        summary = summary.drop(columns="agent_name").rename(columns={
+            "best_val_episode": "Episodio seleccionado (media)",
+            "best_val_score": "Best val score (media)",
+            "best_val_sharpe": "Best val Sharpe (media)",
+            "best_val_mdd": "Best val MDD (media)",
+        })
+        summary = summary.round(4)
+        return dash_table.DataTable(
+            data=summary.to_dict("records"),
+            columns=[{"name": column, "id": column} for column in summary.columns],
+            style_table={"overflowX": "auto", "fontSize": "12px"},
+            style_header=TABLE_HEADER_STYLE,
+            style_cell=TABLE_CELL_STYLE,
+            style_data_conditional=TABLE_CELL_COND,
+        )
+    except Exception as exc:
+        return html.Div(f"Error de validación: {exc}", style={"color": "#c53030"})
+
+
+@app.callback(
+    Output("methodology-config", "children"),
+    Input("dashboard-data", "data"),
+)
+def update_methodology_notes(data):
+    """Expone la configuracion efectiva en vez de asumir valores fijos."""
+    config = (data or {}).get("experiment_config") or {}
+    if not config:
+        return html.Div([
+            html.H3("Configuración de la run"),
+            html.P(
+                "No hay experiment_config.json; las métricas mostradas se leen "
+                "directamente de los CSV disponibles."
+            ),
+        ])
+
+    labels = [
+        ("tickers", "Tickers"),
+        ("seeds", "Semillas"),
+        ("n_training_episodes", "Episodios de entrenamiento"),
+        ("max_steps_per_episode", "Máximo de pasos por episodio"),
+        ("reward_mode", "Modo de recompensa"),
+        ("random_start_train", "Inicio aleatorio en entrenamiento"),
+        ("use_internal_validation", "Validación interna"),
+        ("internal_val_ratio", "Ratio de validación interna"),
+        ("dqn_hidden_dim", "Dimensión oculta DirectDQN"),
+        ("latent_q_hidden_dim", "Dimensión oculta Q latente"),
+        ("transaction_cost", "Coste de transacción"),
+    ]
+
+    def render_value(value):
+        if isinstance(value, bool):
+            return "Sí" if value else "No"
+        if isinstance(value, list):
+            return ", ".join(map(str, value))
+        return "—" if value is None else str(value)
+
+    rows = [
+        html.Tr([
+            html.Td(html.Strong(label), style={"paddingRight": "24px"}),
+            html.Td(render_value(config.get(key))),
+        ])
+        for key, label in labels
+        if key in config
+    ]
+    return html.Div([
+        html.H3("Configuración de la run"),
+        html.Table(html.Tbody(rows), className="config-table"),
+        html.P(
+            "Sharpe OOS es la vista inicial porque facilita la comparación "
+            "riesgo-retorno entre activos; debe interpretarse junto con retorno, "
+            "drawdown, estabilidad entre semillas, gap IS/OOS e IVL.",
+            className="methodology-note",
+        ),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -751,4 +1080,4 @@ if __name__ == "__main__":
             print(f"  - {fname}")
         print()
 
-    app.run(debug=True, host="127.0.0.1", port=8050)
+    app.run(debug=True, use_reloader=False, host="127.0.0.1", port=8050)

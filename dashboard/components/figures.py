@@ -11,6 +11,11 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Tuple
 
+from latent_rl.reporting.agent_metadata import (
+    AGENT_COLORS as AGENT_COLOR_MAP,
+    agent_display_name,
+)
+
 # Paleta coherente con el CSS
 ACCENT      = "#3b6fd4"
 POSITIVE    = "#276749"
@@ -24,6 +29,20 @@ AXIS_FONT   = dict(size=11, color="#718096")
 AGENT_COLORS = [
     "#3b6fd4", "#276749", "#c53030", "#b7791f", "#553c9a",
 ]
+
+AGENT_METRICS = {
+    "mean_sharpe_oos": ("Sharpe OOS", "Sharpe OOS por Agente"),
+    "mean_return_oos": ("Retorno OOS", "Retorno OOS por Agente"),
+    "mean_mdd_oos": ("Max Drawdown OOS", "Max Drawdown OOS por Agente"),
+    "sharpe_gap": ("|Sharpe IS - Sharpe OOS|", "Gap Sharpe IS/OOS por Agente"),
+    "mean_n_trades": ("Nº medio de trades", "Operativa Media por Agente"),
+    "mean_equity_oos": ("Equity final OOS", "Equity Final OOS por Agente"),
+}
+
+SEED_METRICS = {
+    "sharpe": "Sharpe OOS",
+    "total_return": "Retorno total OOS",
+}
 
 
 # ── helpers internos ──────────────────────────────────────────────────────────
@@ -111,6 +130,53 @@ def validate_dataframe(df: pd.DataFrame, required_columns: list) -> Tuple[bool, 
 
 # ── figuras principales ───────────────────────────────────────────────────────
 
+def create_agent_metric_bar(
+    df: pd.DataFrame, metric: str = "mean_sharpe_oos"
+) -> go.Figure:
+    """Barras por agente para una metrica seleccionada."""
+    if df is None or df.empty:
+        return create_empty_figure("No hay datos de agentes disponibles")
+    frame = df.copy()
+    if metric == "sharpe_gap" and {
+        "mean_sharpe_is",
+        "mean_sharpe_oos",
+    }.issubset(frame.columns):
+        frame[metric] = (frame["mean_sharpe_is"] - frame["mean_sharpe_oos"]).abs()
+    if metric not in frame.columns:
+        return create_empty_figure(f"La metrica {metric} no esta disponible")
+    try:
+        agent_col = _detect_agent_col(frame)
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+
+    label, title = AGENT_METRICS.get(metric, (metric, f"{metric} por Agente"))
+    agents = frame[agent_col].astype(str).tolist()
+    values = frame[metric].astype(float).tolist()
+    fig = go.Figure(
+        go.Bar(
+            y=[agent_display_name(agent) for agent in agents],
+            x=values,
+            orientation="h",
+            marker_color=[AGENT_COLOR_MAP.get(agent, ACCENT) for agent in agents],
+            text=[f"{value:+.3f}" for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=f"Agente=%{{y}}<br>{label}=%{{x:.4f}}<extra></extra>",
+        )
+    )
+    fig.add_vline(x=0, line_color="#cbd5e0", line_width=1)
+    _base_layout(
+        fig,
+        title,
+        xaxis_title=label,
+        yaxis_title="",
+        height=350,
+        bargap=0.3,
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
 def create_agent_return_bar(df: pd.DataFrame) -> go.Figure:
     """
     Barras horizontales del retorno medio por agente.
@@ -148,7 +214,7 @@ def create_agent_return_bar(df: pd.DataFrame) -> go.Figure:
                        color="#a0aec0", thickness=1.5, width=4)
 
     fig = go.Figure(go.Bar(
-        y=agents,
+        y=[agent_display_name(agent) for agent in agents],
         x=values,
         orientation="h",
         marker_color=colors,
@@ -203,6 +269,48 @@ def create_seed_return_boxplot(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def create_seed_metric_boxplot(
+    df: pd.DataFrame, metric: str = "sharpe"
+) -> go.Figure:
+    """Boxplot OOS por semilla para Sharpe o retorno total."""
+    label = SEED_METRICS.get(metric)
+    if label is None:
+        return create_empty_figure(f"Metrica por semilla no soportada: {metric}")
+    is_valid, error_msg = validate_dataframe(df, ["seed", metric])
+    if not is_valid:
+        return create_empty_figure(f"Sin datos: {error_msg}")
+    try:
+        agent_col = _detect_agent_col(df)
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+    frame, _ = _filter_split(df)
+    fig = go.Figure()
+    for i, agent in enumerate(frame[agent_col].unique()):
+        values = frame.loc[frame[agent_col] == agent, metric]
+        color = AGENT_COLOR_MAP.get(str(agent), AGENT_COLORS[i % len(AGENT_COLORS)])
+        fig.add_trace(
+            go.Box(
+                y=values,
+                name=agent_display_name(agent),
+                boxpoints="all",
+                jitter=0.4,
+                pointpos=-1.6,
+                marker=dict(size=5, color=color),
+                line=dict(color=color),
+            )
+        )
+    _base_layout(
+        fig,
+        f"Distribucion de {label} por Semilla",
+        yaxis_title=label,
+        xaxis_title="",
+        height=320,
+        showlegend=False,
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e0", line_width=1)
+    return fig
+
+
 def create_seed_return_scatter(df: pd.DataFrame) -> go.Figure:
     """
     Scatter de retorno por semilla para cada agente.
@@ -241,40 +349,78 @@ def create_seed_return_scatter(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def create_seed_metric_scatter(
+    df: pd.DataFrame, metric: str = "sharpe"
+) -> go.Figure:
+    """Evolucion OOS de una metrica por semilla y agente."""
+    label = SEED_METRICS.get(metric)
+    if label is None:
+        return create_empty_figure(f"Metrica por semilla no soportada: {metric}")
+    is_valid, error_msg = validate_dataframe(df, ["seed", metric])
+    if not is_valid:
+        return create_empty_figure(f"Sin datos: {error_msg}")
+    try:
+        agent_col = _detect_agent_col(df)
+    except KeyError as exc:
+        return create_empty_figure(str(exc))
+    frame, _ = _filter_split(df)
+    fig = go.Figure()
+    for i, agent in enumerate(frame[agent_col].unique()):
+        subset = frame[frame[agent_col] == agent].sort_values("seed")
+        color = AGENT_COLOR_MAP.get(str(agent), AGENT_COLORS[i % len(AGENT_COLORS)])
+        fig.add_trace(
+            go.Scatter(
+                x=subset["seed"],
+                y=subset[metric],
+                mode="markers+lines",
+                name=agent_display_name(agent),
+                marker=dict(size=7, color=color),
+                line=dict(width=1.5, color=color),
+            )
+        )
+    _base_layout(
+        fig,
+        f"{label} por Semilla",
+        xaxis_title="Semilla",
+        yaxis_title=label,
+        height=320,
+        hovermode="x unified",
+        legend=dict(font=dict(size=10), orientation="h", y=-0.22, x=0),
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="#cbd5e0", line_width=1)
+    return fig
+
+
 def create_ivl_delta_bar(df: pd.DataFrame) -> go.Figure:
-    """Barras de los componentes del IVL (delta Sharpe, MDD, Seed Std, IS/OOS Gap)."""
+    """Componentes IVL de uno o varios agentes latentes."""
     is_valid, error_msg = validate_dataframe(
         df, ["delta_sharpe", "delta_mdd", "delta_seed_std", "delta_is_oos_gap"])
     if not is_valid:
         return create_empty_figure(f"Sin datos IVL: {error_msg}")
 
-    row = df.iloc[0]
-    labels = ["d Sharpe", "d MDD", "d Seed Std", "d IS/OOS Gap"]
-    values = [
-        row["delta_sharpe"],
-        row["delta_mdd"],
-        row["delta_seed_std"],
-        row["delta_is_oos_gap"],
-    ]
-    # verde si el delta es favorable para la representacion latente
-    better_positive = [True, False, False, False]
-    colors = [
-        POSITIVE if (bp and v > 0) or (not bp and v < 0) else NEGATIVE
-        for v, bp in zip(values, better_positive)
-    ]
-
-    fig = go.Figure(go.Bar(
-        x=labels,
-        y=values,
-        marker_color=colors,
-        text=[f"{v:+.4f}" for v in values],
-        textposition="outside",
-        textfont=dict(size=11),
-    ))
+    labels = ["Δ Sharpe", "Δ MDD", "Δ Seed Std", "Δ Gap IS/OOS"]
+    columns = ["delta_sharpe", "delta_mdd", "delta_seed_std", "delta_is_oos_gap"]
+    fig = go.Figure()
+    agent_col = "latent_agent" if "latent_agent" in df.columns else None
+    for index, (_, row) in enumerate(df.iterrows()):
+        agent = str(row[agent_col]) if agent_col else f"Latente {index + 1}"
+        values = [float(row[column]) for column in columns]
+        fig.add_trace(
+            go.Bar(
+                name=agent_display_name(agent),
+                x=labels,
+                y=values,
+                marker_color=AGENT_COLOR_MAP.get(agent, AGENT_COLORS[index % len(AGENT_COLORS)]),
+                text=[f"{value:+.3f}" for value in values],
+                textposition="outside",
+                cliponaxis=False,
+            )
+        )
 
     fig.add_hline(y=0, line_color="#cbd5e0", line_width=1)
     _base_layout(fig, "Componentes del IVL",
-                 yaxis_title="Valor del delta", height=300)
+                 yaxis_title="Valor del delta", height=330, barmode="group",
+                 legend=dict(font=dict(size=10), orientation="h", y=-0.28, x=0))
     return fig
 
 
@@ -367,7 +513,9 @@ def create_pca_vs_next_return_scatter(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def create_cross_ticker_ivl_chart(df: pd.DataFrame) -> go.Figure:
+def create_cross_ticker_ivl_chart(
+    df: pd.DataFrame, view: str = "bars"
+) -> go.Figure:
     """
     Barras agrupadas del IVL por ticker y agente latente.
 
@@ -385,19 +533,49 @@ def create_cross_ticker_ivl_chart(df: pd.DataFrame) -> go.Figure:
     if df is None or df.empty:
         return create_empty_figure("Sin datos cross-ticker disponibles")
 
-    detail = df[~df["ticker"].isin(["MEAN", "STD"])].copy()
+    detail = df[~df["ticker"].astype(str).str.upper().isin(["MEAN", "STD"])].copy()
     if detail.empty:
         return create_empty_figure("Sin datos de tickers individuales")
 
-    latent_agents = detail["latent_agent"].unique()
+    detail = detail.drop_duplicates(subset=["ticker", "latent_agent"], keep="last")
+    mean_rows = (
+        detail.groupby("latent_agent", as_index=False)["ivl"].mean().assign(ticker="MEAN")
+    )
+    plot_df = pd.concat([detail, mean_rows], ignore_index=True)
+    latent_agents = plot_df["latent_agent"].unique()
+
+    if view == "heatmap":
+        pivot = plot_df.pivot(index="latent_agent", columns="ticker", values="ivl")
+        column_order = detail["ticker"].drop_duplicates().tolist() + ["MEAN"]
+        pivot = pivot.reindex(columns=column_order)
+        z = pivot.to_numpy(dtype=float)
+        finite = np.abs(z[np.isfinite(z)])
+        limit = float(finite.max()) if finite.size else 1.0
+        limit = limit if limit > 0 else 1.0
+        text = np.where(np.isnan(z), "", np.vectorize(lambda value: f"{value:+.3f}")(z))
+        fig = go.Figure(go.Heatmap(
+            z=z,
+            x=pivot.columns,
+            y=[agent_display_name(agent) for agent in pivot.index],
+            zmin=-limit,
+            zmax=limit,
+            zmid=0,
+            colorscale="RdBu",
+            text=text,
+            texttemplate="%{text}",
+            colorbar=dict(title="IVL"),
+        ))
+        _base_layout(fig, "IVL Cross-Ticker", xaxis_title="Ticker",
+                     yaxis_title="Agente latente", height=360)
+        return fig
 
     fig = go.Figure()
     for i, latent_agent in enumerate(latent_agents):
-        sub = detail[detail["latent_agent"] == latent_agent]
-        color = AGENT_COLORS[i % len(AGENT_COLORS)]
+        sub = plot_df[plot_df["latent_agent"] == latent_agent]
+        color = AGENT_COLOR_MAP.get(str(latent_agent), AGENT_COLORS[i % len(AGENT_COLORS)])
         ivl_vals = sub["ivl"].tolist()
         fig.add_trace(go.Bar(
-            name=latent_agent,
+            name=agent_display_name(latent_agent),
             x=sub["ticker"].tolist(),
             y=ivl_vals,
             marker_color=color,

@@ -10,9 +10,11 @@ La detección es automática: si existen subdirectorios con datos validos
 existe el archivo plano se usa el formato legacy.
 """
 
+import json
+
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 _results_dir_override: Optional[Path] = None
@@ -208,6 +210,33 @@ def load_ticker_comparison() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
         return None, f"Error al cargar ticker_comparison.csv: {exc}"
 
 
+def load_validation_metrics(
+    ticker: Optional[str] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Carga la trazabilidad de validacion interna cuando esta disponible."""
+    csv_path = _resolve_data_dir(ticker) / "validation_metrics.csv"
+    if not csv_path.exists():
+        return None, f"No se encontro {csv_path} (archivo opcional)"
+    try:
+        return pd.read_csv(csv_path), None
+    except Exception as exc:
+        return None, f"Error al cargar validation_metrics.csv: {exc}"
+
+
+def load_experiment_config() -> Tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Carga la configuracion estructurada de la run cuando existe."""
+    json_path = get_results_path() / "experiment_config.json"
+    if not json_path.exists():
+        return None, f"No se encontro {json_path} (archivo opcional)"
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("la raiz JSON no es un objeto")
+        return payload, None
+    except Exception as exc:
+        return None, f"Error al cargar experiment_config.json: {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Carga agregada
 # ---------------------------------------------------------------------------
@@ -230,7 +259,7 @@ def _effective_ticker(ticker: Optional[str]) -> Optional[str]:
 
 def load_all_dashboard_data(
     ticker: Optional[str] = None,
-) -> Dict[str, Tuple[Optional[pd.DataFrame], Optional[str]]]:
+) -> Dict[str, Tuple[Any, Optional[str]]]:
     """
     Carga todos los datos necesarios para el dashboard.
 
@@ -247,13 +276,16 @@ def load_all_dashboard_data(
     Returns:
         Diccionario ``{dataset_name: (DataFrame, error_message)}``.
         Claves: ``"agent_summary"``, ``"agent_seed_metrics"``,
-        ``"ivl_results"``, ``"latent_index"``, ``"ticker_comparison"``.
+        ``"ivl_results"``, ``"validation_metrics"``, ``"experiment_config"``,
+        ``"latent_index"`` y ``"ticker_comparison"``.
     """
     eff = _effective_ticker(ticker)
     return {
         "agent_summary":      load_agent_summary(eff),
         "agent_seed_metrics": load_agent_seed_metrics(eff),
         "ivl_results":        load_ivl_results(eff),
+        "validation_metrics": load_validation_metrics(eff),
+        "experiment_config":  load_experiment_config(),
         "latent_index":       load_latent_index(),
         "ticker_comparison":  load_ticker_comparison(),
     }

@@ -328,6 +328,7 @@ class TestLoadAllDashboardData:
             data = load_all_dashboard_data(ticker=None)
         expected_keys = {
             "agent_summary", "agent_seed_metrics",
-            "ivl_results", "latent_index", "ticker_comparison",
+            "ivl_results", "validation_metrics", "experiment_config",
+            "latent_index", "ticker_comparison",
         }
         assert expected_keys == set(data.keys())

@@ -102,11 +102,23 @@ Lee los CSVs existentes y recalcula el IVL. Para una campaña concreta, pasa
 ### Paso 4 — Dashboard
 
 ```powershell
-python dashboard\app.py
+python dashboard\app.py --results-dir results/abcd_robust_h64
 ```
 
 Abre **http://127.0.0.1:8050** en el navegador. El dashboard detecta
 automáticamente los resultados disponibles.
+
+### Paso 5 — Figuras reproducibles desde resultados existentes (opcional)
+
+```powershell
+python scripts\export_memory_figures.py `
+  --results-dir results/abcd_robust_h64 `
+  --out-dir artifacts/memory_figures/ABCD_robust_h64
+```
+
+Este comando no entrena agentes ni modifica los CSV. Exporta las figuras
+agregadas y su `figure_manifest.json`; usa `--include-optional` para incluir
+el scatter riesgo-retorno y la estabilidad entre semillas.
 
 > **Nota Windows:** si ves `UnicodeEncodeError`, añade `$env:PYTHONUTF8=1` antes de cada comando.
 
@@ -194,6 +206,7 @@ latent-rl/
 │   ├── pretraining/     # AutoencoderTrainer
 │   ├── evaluation/      # FinancialMetrics, LatentAdvantageIndex (IVL)
 │   ├── experiments/     # ExperimentConfig, run_experiment, pipeline completo
+│   ├── reporting/       # Loader agregado y figuras reproducibles
 │   ├── analysis/        # LatentIndexAnalyzer (PCA, norm, first-component)
 │   └── data/            # CSVDataLoader, DataPreprocessor, YahooFinanceLoader
 ├── scripts/

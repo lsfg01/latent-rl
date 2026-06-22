@@ -72,6 +72,7 @@ Thumbs.db
 /results/
 /models/
 /reports/
+/artifacts/
 /logs/
 *.log
 # Claude Code local files

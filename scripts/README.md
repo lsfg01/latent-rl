@@ -22,4 +22,12 @@ Utilidades:
 python -m scripts.utilities.generate_example_data
 python -m scripts.utilities.compute_ivl --help
 python dashboard\app.py --results-dir results/abcd_robust_h64
+python scripts\export_memory_figures.py `
+  --results-dir results/abcd_robust_h64 `
+  --out-dir artifacts/memory_figures/ABCD_robust_h64
 ```
+
+El exportador solo lee los CSV finales. Genera F1-F4 y un
+`figure_manifest.json`; `--include-optional` añade F5/F6. Si Plotly no puede
+usar Kaleido para PNG/SVG, conserva la ejecución y crea HTML interactivo como
+fallback.

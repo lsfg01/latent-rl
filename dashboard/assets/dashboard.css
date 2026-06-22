@@ -420,6 +420,71 @@ body {
   white-space: nowrap;
 }
 
+.experiment-details {
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: #f8faff;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.88em;
+}
+
+.experiment-details summary,
+.collapsible-section summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.experiment-details p { margin: 12px 0 8px; }
+.experiment-details ul { margin: 8px 0 0; padding-left: 22px; }
+.experiment-details li { margin: 7px 0; line-height: 1.45; }
+
+.inline-selector {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 14px;
+}
+
+.view-selector {
+  margin: 2px 0 10px;
+  color: var(--muted);
+  font-size: 0.86em;
+}
+
+.view-selector label { margin-right: 18px; }
+
+.ivl-selection-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.78em;
+  font-weight: 600;
+}
+
+.collapsible-section > p { margin-top: 12px; }
+
+.config-table {
+  border-collapse: collapse;
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.config-table td {
+  padding: 3px 8px 3px 0;
+  vertical-align: top;
+}
+
+.methodology-note {
+  padding: 10px 12px;
+  background: #f7fafc;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+}
+
 /* ============================================================
    CROSS-TICKER
    ============================================================ */
