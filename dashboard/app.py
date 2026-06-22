@@ -143,7 +143,7 @@ def run_dashboard_data_scripts():
     """
     scripts = [
         "examples/compare_agents_multiseed_experiment.py",
-        "examples/compute_ivl_from_results.py",
+        "scripts/utilities/compute_ivl.py",
     ]
 
     log_lines = []

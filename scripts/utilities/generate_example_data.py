@@ -13,7 +13,7 @@ Salida:
     results/SPY/ivl_results.csv
 
 Uso:
-    python generate_example_data.py
+    python -m scripts.utilities.generate_example_data
     python dashboard/app.py
 """
 
@@ -24,8 +24,8 @@ import pandas as pd
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from latent_rl.data.features import FeatureEngineer
 from latent_rl.experiments.config import ExperimentConfig
@@ -117,7 +117,7 @@ def main():
     print("\n[4] Agregando resultados y guardando CSVs...")
     aggregated = aggregate_results(all_results)
 
-    results_dir = ROOT / "results" / "SPY"
+    results_dir = PROJECT_ROOT / "results" / "SPY"
     export_dashboard_results(all_results, aggregated, results_dir=results_dir)
 
     ivl_records = compute_ivl(aggregated, cfg)

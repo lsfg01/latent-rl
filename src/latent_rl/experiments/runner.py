@@ -14,6 +14,7 @@ Brazos experimentales:
 
 from __future__ import annotations
 
+import copy
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ from .utils import (
     load_ticker_with_config,
     split_data,
     normalize_is_oos,
+    normalize_train_val_oos,
+    split_internal_validation,
     walk_forward_splits,
     evaluate_agent,
     aggregate_results,
@@ -57,9 +60,13 @@ class FrozenEncoderContext:
     iteración, por lo que precomputarlo no altera los resultados numéricos.
     """
     c_encoder: Optional[Any]
+    c_latents_train: Optional[np.ndarray]
+    c_latents_val: Optional[np.ndarray]
     c_latents_is: Optional[np.ndarray]    # (T_is, latent_dim)
     c_latents_oos: Optional[np.ndarray]   # (T_oos, latent_dim)
     d_encoder: Optional[Any]
+    d_latents_train: Optional[np.ndarray]
+    d_latents_val: Optional[np.ndarray]
     d_latents_is: Optional[np.ndarray]    # (T_is, latent_dim)
     d_latents_oos: Optional[np.ndarray]   # (T_oos, latent_dim)
 
@@ -113,35 +120,58 @@ def _build_frozen_ctx(
     data_oos: pd.DataFrame,
     cfg: ExperimentConfig,
     d_encoder: Optional[Any],
+    data_train: Optional[pd.DataFrame] = None,
+    data_val: Optional[pd.DataFrame] = None,
 ) -> FrozenEncoderContext:
     """Precomputa latentes para C y D antes del bucle de semillas."""
     features = list(cfg.features) if cfg.features else []
     device = torch.device(cfg.device)
     L = cfg.lookback_window
 
-    c_encoder = c_latents_is = c_latents_oos = None
+    train_source = data_train if data_train is not None else data_is
+    c_encoder = c_latents_train = c_latents_val = None
+    c_latents_is = c_latents_oos = None
+    d_latents_train = d_latents_val = None
     d_latents_is = d_latents_oos = None
 
     if "C" in cfg.run_arms and features:
         print("  [ctx] Entrenando encoder ligero (brazo C)...")
-        c_encoder = prepare_arm_c_encoder(data_is, cfg)
+        c_encoder = prepare_arm_c_encoder(train_source, cfg)
         if c_encoder is not None:
             c_encoder = c_encoder.to(device)
-            print("  [ctx] Precomputando latentes C (IS + OOS)...")
+            print("  [ctx] Precomputando latentes C (train/val + IS/OOS)...")
+            c_latents_train = precompute_latent_series(
+                train_source, L, features, c_encoder, device
+            )
+            if data_val is not None:
+                c_latents_val = precompute_latent_series(
+                    data_val, L, features, c_encoder, device
+                )
             c_latents_is  = precompute_latent_series(data_is,  L, features, c_encoder, device)
             c_latents_oos = precompute_latent_series(data_oos, L, features, c_encoder, device)
 
     if "D" in cfg.run_arms and d_encoder is not None and features:
         print("  [ctx] Precomputando latentes D (IS + OOS)...")
         d_enc = d_encoder.to(device)
+        d_latents_train = precompute_latent_series(
+            train_source, L, features, d_enc, device
+        )
+        if data_val is not None:
+            d_latents_val = precompute_latent_series(
+                data_val, L, features, d_enc, device
+            )
         d_latents_is  = precompute_latent_series(data_is,  L, features, d_enc, device)
         d_latents_oos = precompute_latent_series(data_oos, L, features, d_enc, device)
 
     return FrozenEncoderContext(
         c_encoder=c_encoder,
+        c_latents_train=c_latents_train,
+        c_latents_val=c_latents_val,
         c_latents_is=c_latents_is,
         c_latents_oos=c_latents_oos,
         d_encoder=d_encoder,
+        d_latents_train=d_latents_train,
+        d_latents_val=d_latents_val,
         d_latents_is=d_latents_is,
         d_latents_oos=d_latents_oos,
     )
@@ -160,6 +190,9 @@ def _build_env_kwargs(cfg: ExperimentConfig, data: pd.DataFrame) -> dict:
         transaction_cost=cfg.transaction_cost,
         feature_cols=feature_cols,
         price_col="close",
+        reward_mode=cfg.reward_mode,
+        reward_clip=cfg.reward_clip,
+        trade_penalty=cfg.trade_penalty,
     )
 
 
@@ -192,6 +225,9 @@ def _make_latent_agent(
         buffer_capacity=cfg.latent_buffer_capacity,
         target_update_freq=cfg.latent_target_update,
         q_hidden_dim=cfg.latent_q_hidden_dim,
+        weight_decay=cfg.latent_weight_decay,
+        grad_clip_norm=cfg.latent_grad_clip_norm,
+        q_dropout=cfg.latent_q_dropout,
         freeze_encoder=freeze_encoder,
         device=cfg.device,
     )
@@ -216,14 +252,77 @@ def _make_precomputed_latent_agent(
         buffer_capacity=cfg.latent_buffer_capacity,
         target_update_freq=cfg.latent_target_update,
         q_hidden_dim=cfg.latent_q_hidden_dim,
+        weight_decay=cfg.latent_weight_decay,
+        grad_clip_norm=cfg.latent_grad_clip_norm,
+        q_dropout=cfg.latent_q_dropout,
         device=cfg.device,
     )
 
 
-def _train_agent(env, agent, n_episodes: int, cfg: ExperimentConfig):
-    """Bucle de entrenamiento RL genérico."""
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
+def _capture_agent_state(agent) -> Dict[str, Any]:
+    """Copia el estado entrenable sin serializarlo a disco."""
+    state: Dict[str, Any] = {}
+    for name in ("encoder", "q_network", "target_network"):
+        module = getattr(agent, name, None)
+        if isinstance(module, torch.nn.Module):
+            state[f"{name}_state"] = copy.deepcopy(module.state_dict())
+            state[f"{name}_training"] = module.training
+    optimizer = getattr(agent, "optimizer", None)
+    if optimizer is not None:
+        state["optimizer_state"] = copy.deepcopy(optimizer.state_dict())
+    for name in ("epsilon", "update_step"):
+        if hasattr(agent, name):
+            state[name] = getattr(agent, name)
+    return state
+
+
+def _restore_agent_state(agent, state: Dict[str, Any]) -> None:
+    for name in ("encoder", "q_network", "target_network"):
+        module = getattr(agent, name, None)
+        key = f"{name}_state"
+        if isinstance(module, torch.nn.Module) and key in state:
+            module.load_state_dict(state[key])
+            module.train(state[f"{name}_training"])
+    if "optimizer_state" in state and getattr(agent, "optimizer", None) is not None:
+        agent.optimizer.load_state_dict(state["optimizer_state"])
+    for name in ("epsilon", "update_step"):
+        if name in state:
+            setattr(agent, name, state[name])
+
+
+def _validation_score(metrics: Dict[str, float], cfg: ExperimentConfig) -> float:
+    trade_rate = metrics["n_trades"] / max(metrics["steps"], 1.0)
+    return float(
+        metrics["sharpe"]
+        - cfg.validation_score_mdd_weight * abs(metrics["max_drawdown"])
+        - cfg.validation_score_trade_weight * trade_rate
+    )
+
+
+def _train_agent(
+    env,
+    agent,
+    n_episodes: int,
+    cfg: ExperimentConfig,
+    validation_env=None,
+    seed: Optional[int] = None,
+):
+    """Bucle RL con random starts y seleccion opcional por validacion temporal."""
+    best_state: Optional[Dict[str, Any]] = None
+    best_metrics: Optional[Dict[str, float]] = None
+    best_score = -np.inf
+    validations_without_improvement = 0
+
+    for episode in range(1, n_episodes + 1):
+        reset_kwargs: Dict[str, Any] = {}
+        if cfg.random_start_train:
+            reset_kwargs["options"] = {
+                "random_start": True,
+                "max_steps": cfg.max_steps_per_episode,
+            }
+        if episode == 1 and seed is not None:
+            reset_kwargs["seed"] = seed
+        obs, _ = env.reset(**reset_kwargs)
         done = False
         step = 0
         while not done and step < cfg.max_steps_per_episode:
@@ -235,6 +334,42 @@ def _train_agent(env, agent, n_episodes: int, cfg: ExperimentConfig):
                 agent.update()
             obs = next_obs
             step += 1
+
+        should_validate = validation_env is not None and (
+            episode % cfg.validation_eval_freq == 0 or episode == n_episodes
+        )
+        if should_validate:
+            training_state = _capture_agent_state(agent)
+            val_metrics = evaluate_agent(
+                agent, validation_env, "validation", cfg.n_eval_episodes
+            )
+            _restore_agent_state(agent, training_state)
+            score = _validation_score(val_metrics, cfg)
+            if score > best_score:
+                best_score = score
+                best_state = copy.deepcopy(training_state)
+                best_metrics = dict(val_metrics)
+                best_metrics["episode"] = episode
+                validations_without_improvement = 0
+            else:
+                validations_without_improvement += 1
+
+            if (
+                cfg.validation_patience is not None
+                and validations_without_improvement >= cfg.validation_patience
+            ):
+                break
+
+    if best_state is not None and best_metrics is not None:
+        _restore_agent_state(agent, best_state)
+        agent.validation_metrics = {
+            "best_val_episode": int(best_metrics["episode"]),
+            "best_val_score": float(best_score),
+            "best_val_sharpe": float(best_metrics["sharpe"]),
+            "best_val_mdd": float(best_metrics["max_drawdown"]),
+            "best_val_return": float(best_metrics["total_return"]),
+            "best_val_n_trades": float(best_metrics["n_trades"]),
+        }
     return agent
 
 
@@ -246,6 +381,8 @@ def train_dqn_agent(
     env: FinancialEnv,
     n_episodes: int,
     cfg: ExperimentConfig,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
 ) -> DQNAgent:
     """Crea y entrena un DQNAgent sobre el entorno IS."""
     agent = DQNAgent(
@@ -260,9 +397,14 @@ def train_dqn_agent(
         buffer_capacity=cfg.dqn_buffer_capacity,
         target_update_freq=cfg.dqn_target_update,
         hidden_dim=cfg.dqn_hidden_dim,
+        weight_decay=cfg.dqn_weight_decay,
+        grad_clip_norm=cfg.dqn_grad_clip_norm,
+        dropout=cfg.dqn_dropout,
         device=cfg.device,
     )
-    return _train_agent(env, agent, n_episodes, cfg)
+    return _train_agent(
+        env, agent, n_episodes, cfg, validation_env=validation_env, seed=seed
+    )
 
 
 def train_latent_dqn_agent(
@@ -271,6 +413,8 @@ def train_latent_dqn_agent(
     cfg: ExperimentConfig,
     pretrained: bool = False,
     pretraining_data: Optional[pd.DataFrame] = None,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
 ) -> LatentDQNAgent:
     """Crea y entrena un LatentDQNAgent (legado, mantiene pretrained=bool API).
 
@@ -315,22 +459,36 @@ def train_latent_dqn_agent(
             trainer.save_encoder(str(encoder_path))
             agent.load_pretrained_encoder(str(encoder_path))
 
-    return _train_agent(env, agent, n_episodes, cfg)
+    return _train_agent(
+        env, agent, n_episodes, cfg, validation_env=validation_env, seed=seed
+    )
 
 
 # ---------------------------------------------------------------------------
 # Brazos individuales
 # ---------------------------------------------------------------------------
 
-def _train_arm_a(env: FinancialEnv, n_episodes: int, cfg: ExperimentConfig) -> DQNAgent:
+def _train_arm_a(
+    env: FinancialEnv,
+    n_episodes: int,
+    cfg: ExperimentConfig,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
+) -> DQNAgent:
     """Brazo A: DQNAgent directo."""
-    return train_dqn_agent(env, n_episodes, cfg)
+    return train_dqn_agent(env, n_episodes, cfg, validation_env, seed)
 
 
-def _train_arm_b(env: FinancialEnv, n_episodes: int, cfg: ExperimentConfig) -> LatentDQNAgent:
+def _train_arm_b(
+    env: FinancialEnv,
+    n_episodes: int,
+    cfg: ExperimentConfig,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
+) -> LatentDQNAgent:
     """Brazo B: LatentDQNAgent encoder random, finetune."""
     agent = _make_latent_agent(env, cfg, freeze_encoder=False)
-    return _train_agent(env, agent, n_episodes, cfg)
+    return _train_agent(env, agent, n_episodes, cfg, validation_env, seed)
 
 
 def _train_arm_c(
@@ -338,6 +496,8 @@ def _train_arm_c(
     n_episodes: int,
     cfg: ExperimentConfig,
     data_is: pd.DataFrame,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
 ) -> LatentDQNAgent:
     """Brazo C: encoder ligero pretrained en IS del pliegue, frozen."""
     from latent_rl.pretraining.encoder_pretrainer import EncoderPretrainer
@@ -383,13 +543,15 @@ def _train_arm_c(
         agent.encoder = loaded_enc.to(agent.device)
         agent.encoder.freeze()
 
-    return _train_agent(env, agent, n_episodes, cfg)
+    return _train_agent(env, agent, n_episodes, cfg, validation_env, seed)
 
 
 def _train_arm_d(
     env: FinancialEnv,
     n_episodes: int,
     cfg: ExperimentConfig,
+    validation_env: Optional[FinancialEnv] = None,
+    seed: Optional[int] = None,
 ) -> Optional[LatentDQNAgent]:
     """Brazo D: encoder heavy offline, frozen. Omite si no hay ruta configurada."""
     if not cfg.heavy_encoder_path:
@@ -403,7 +565,7 @@ def _train_arm_d(
         print(f"  Brazo D omitido: error cargando artefacto ({exc})")
         return None
 
-    return _train_agent(env, agent, n_episodes, cfg)
+    return _train_agent(env, agent, n_episodes, cfg, validation_env, seed)
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +578,8 @@ def run_single_seed(
     data_oos: pd.DataFrame,
     cfg: ExperimentConfig,
     frozen_ctx: Optional[FrozenEncoderContext] = None,
+    data_train: Optional[pd.DataFrame] = None,
+    data_val: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Ejecuta el experimento completo para una semilla específica.
@@ -437,10 +601,17 @@ def run_single_seed(
     """
     print(f"\n--- Ejecutando semilla {seed} ---")
     np.random.seed(seed)
+    torch.manual_seed(seed)
 
     env_kw = _build_env_kwargs(cfg, data_is)
     env_is  = FinancialEnv(data=data_is,  **env_kw)
     env_oos = FinancialEnv(data=data_oos, **env_kw)
+    train_data = data_train if data_train is not None else data_is
+    env_train = FinancialEnv(data=train_data, **env_kw)
+    env_val = FinancialEnv(data=data_val, **env_kw) if data_val is not None else None
+    for env in (env_is, env_oos, env_train, env_val):
+        if env is not None:
+            env.action_space.seed(seed)
 
     n_train = cfg.n_training_episodes
     n_eval  = cfg.n_eval_episodes
@@ -460,63 +631,98 @@ def run_single_seed(
 
     arms = cfg.run_arms
 
-    if "A" in arms:
-        agent_a = _train_arm_a(env_is, n_train, cfg)
-        results["A"] = {
-            "is":  evaluate_agent(agent_a, env_is,  "A", n_eval),
-            "oos": evaluate_agent(agent_a, env_oos, "A", n_eval),
+    def store_agent_results(name: str, agent, eval_is, eval_oos) -> None:
+        results[name] = {
+            "is": evaluate_agent(agent, eval_is, name, n_eval),
+            "oos": evaluate_agent(agent, eval_oos, name, n_eval),
         }
+        if hasattr(agent, "validation_metrics"):
+            results[name]["validation"] = dict(agent.validation_metrics)
+
+    if "A" in arms:
+        agent_a = _train_arm_a(env_train, n_train, cfg, env_val, seed)
+        store_agent_results("A", agent_a, env_is, env_oos)
 
     if "B" in arms:
-        agent_b = _train_arm_b(env_is, n_train, cfg)
-        results["B"] = {
-            "is":  evaluate_agent(agent_b, env_is,  "B", n_eval),
-            "oos": evaluate_agent(agent_b, env_oos, "B", n_eval),
-        }
+        agent_b = _train_arm_b(env_train, n_train, cfg, env_val, seed)
+        store_agent_results("B", agent_b, env_is, env_oos)
 
     if "C" in arms:
         if frozen_ctx is not None and frozen_ctx.c_latents_is is not None:
             # Ruta optimizada: latentes precomputados, sin correr el encoder en RL
-            w_c_is  = LatentObservationWrapper(FinancialEnv(data=data_is,  **env_kw), frozen_ctx.c_latents_is)
-            w_c_oos = LatentObservationWrapper(FinancialEnv(data=data_oos, **env_kw), frozen_ctx.c_latents_oos)
-            agent_c = _make_precomputed_latent_agent(w_c_is, cfg)
-            _train_agent(w_c_is, agent_c, n_train, cfg)
-            results["C"] = {
-                "is":  evaluate_agent(agent_c, w_c_is,  "C", n_eval),
-                "oos": evaluate_agent(agent_c, w_c_oos, "C", n_eval),
-            }
+            w_c_train = LatentObservationWrapper(
+                FinancialEnv(data=train_data, **env_kw), frozen_ctx.c_latents_train
+            )
+            w_c_val = (
+                LatentObservationWrapper(
+                    FinancialEnv(data=data_val, **env_kw), frozen_ctx.c_latents_val
+                )
+                if data_val is not None and frozen_ctx.c_latents_val is not None
+                else None
+            )
+            w_c_is = LatentObservationWrapper(
+                FinancialEnv(data=data_is, **env_kw), frozen_ctx.c_latents_is
+            )
+            w_c_oos = LatentObservationWrapper(
+                FinancialEnv(data=data_oos, **env_kw), frozen_ctx.c_latents_oos
+            )
+            for wrapped_env in (w_c_train, w_c_val, w_c_is, w_c_oos):
+                if wrapped_env is not None:
+                    wrapped_env.action_space.seed(seed)
+            agent_c = _make_precomputed_latent_agent(w_c_train, cfg)
+            _train_agent(w_c_train, agent_c, n_train, cfg, w_c_val, seed)
+            store_agent_results("C", agent_c, w_c_is, w_c_oos)
+            w_c_train.close()
+            if w_c_val is not None:
+                w_c_val.close()
             w_c_is.close()
             w_c_oos.close()
         else:
-            agent_c = _train_arm_c(env_is, n_train, cfg, data_is)
-            results["C"] = {
-                "is":  evaluate_agent(agent_c, env_is,  "C", n_eval),
-                "oos": evaluate_agent(agent_c, env_oos, "C", n_eval),
-            }
+            agent_c = _train_arm_c(
+                env_train, n_train, cfg, train_data, env_val, seed
+            )
+            store_agent_results("C", agent_c, env_is, env_oos)
 
     if "D" in arms:
         if frozen_ctx is not None and frozen_ctx.d_latents_is is not None:
             # Ruta optimizada: latentes precomputados del encoder gordo offline
-            w_d_is  = LatentObservationWrapper(FinancialEnv(data=data_is,  **env_kw), frozen_ctx.d_latents_is)
-            w_d_oos = LatentObservationWrapper(FinancialEnv(data=data_oos, **env_kw), frozen_ctx.d_latents_oos)
-            agent_d = _make_precomputed_latent_agent(w_d_is, cfg)
-            _train_agent(w_d_is, agent_d, n_train, cfg)
-            results["D"] = {
-                "is":  evaluate_agent(agent_d, w_d_is,  "D", n_eval),
-                "oos": evaluate_agent(agent_d, w_d_oos, "D", n_eval),
-            }
+            w_d_train = LatentObservationWrapper(
+                FinancialEnv(data=train_data, **env_kw), frozen_ctx.d_latents_train
+            )
+            w_d_val = (
+                LatentObservationWrapper(
+                    FinancialEnv(data=data_val, **env_kw), frozen_ctx.d_latents_val
+                )
+                if data_val is not None and frozen_ctx.d_latents_val is not None
+                else None
+            )
+            w_d_is = LatentObservationWrapper(
+                FinancialEnv(data=data_is, **env_kw), frozen_ctx.d_latents_is
+            )
+            w_d_oos = LatentObservationWrapper(
+                FinancialEnv(data=data_oos, **env_kw), frozen_ctx.d_latents_oos
+            )
+            for wrapped_env in (w_d_train, w_d_val, w_d_is, w_d_oos):
+                if wrapped_env is not None:
+                    wrapped_env.action_space.seed(seed)
+            agent_d = _make_precomputed_latent_agent(w_d_train, cfg)
+            _train_agent(w_d_train, agent_d, n_train, cfg, w_d_val, seed)
+            store_agent_results("D", agent_d, w_d_is, w_d_oos)
+            w_d_train.close()
+            if w_d_val is not None:
+                w_d_val.close()
             w_d_is.close()
             w_d_oos.close()
         else:
-            agent_d = _train_arm_d(env_is, n_train, cfg)
+            agent_d = _train_arm_d(env_train, n_train, cfg, env_val, seed)
             if agent_d is not None:
-                results["D"] = {
-                    "is":  evaluate_agent(agent_d, env_is,  "D", n_eval),
-                    "oos": evaluate_agent(agent_d, env_oos, "D", n_eval),
-                }
+                store_agent_results("D", agent_d, env_is, env_oos)
 
     env_is.close()
     env_oos.close()
+    env_train.close()
+    if env_val is not None:
+        env_val.close()
 
     return results
 
@@ -772,6 +978,52 @@ def _export_wf_window_metrics(
 # Pipeline para un único ticker
 # ---------------------------------------------------------------------------
 
+def _prepare_train_val_eval_splits(
+    data_is: pd.DataFrame,
+    data_oos: pd.DataFrame,
+    cfg: ExperimentConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    """Prepara IS de evaluacion, OOS, IS_train e IS_val sin leakage."""
+    if cfg.use_internal_validation:
+        data_train, data_val = split_internal_validation(
+            data_is, cfg.internal_val_ratio, cfg.lookback_window
+        )
+        if cfg.normalize_features and cfg.features:
+            data_train, data_val, data_oos, normalizer = normalize_train_val_oos(
+                data_train, data_val, data_oos
+            )
+            data_is = normalizer.transform(data_is)
+        return data_is, data_oos, data_train, data_val
+
+    if cfg.normalize_features and cfg.features:
+        data_is, data_oos, _ = normalize_is_oos(data_is, data_oos)
+    return data_is, data_oos, data_is, None
+
+
+def _export_validation_metrics(
+    all_results: List[Dict[str, Dict[str, Any]]],
+    seeds: List[int],
+    ticker: str,
+    hidden_dim: int,
+    results_dir: Path,
+) -> None:
+    rows: List[Dict[str, Any]] = []
+    for seed, seed_results in zip(seeds, all_results):
+        for agent_name, splits in seed_results.items():
+            metrics = splits.get("validation")
+            if metrics is None:
+                continue
+            rows.append({
+                "ticker": ticker,
+                "hidden_dim": hidden_dim,
+                "agent_name": agent_name,
+                "seed": seed,
+                **metrics,
+            })
+    if rows:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(results_dir / "validation_metrics.csv", index=False)
+
 def _run_single_ticker(
     ticker: str,
     cfg: ExperimentConfig,
@@ -814,14 +1066,17 @@ def _run_single_ticker(
                 f"\n  WF ventana {wf_idx + 1}/{cfg.wf_n_windows}: "
                 f"IS={len(wf_is)} filas  OOS={len(wf_oos)} filas  n_features={n_features}"
             )
-            if cfg.normalize_features and cfg.features:
-                wf_is, wf_oos, _ = normalize_is_oos(wf_is, wf_oos)
+            wf_is, wf_oos, wf_train, wf_val = _prepare_train_val_eval_splits(
+                wf_is, wf_oos, cfg
+            )
 
             # Encoder de D no se reentrena; el encoder de C se entrena una vez
             # por ventana (IS crece, stats cambian). Anti-fuga de D: el encoder
             # gordo fue preentrenado con un universo disjunto por activo, así que
             # no ha visto este activo en ninguna ventana.
-            frozen_ctx = _build_frozen_ctx(wf_is, wf_oos, cfg, d_encoder)
+            frozen_ctx = _build_frozen_ctx(
+                wf_is, wf_oos, cfg, d_encoder, wf_train, wf_val
+            )
 
             # Todas las semillas dentro de esta ventana
             window_seed_results: List[Dict] = []
@@ -829,6 +1084,7 @@ def _run_single_ticker(
                 sr = run_single_seed(
                     seed=seed, data_is=wf_is, data_oos=wf_oos,
                     cfg=cfg, frozen_ctx=frozen_ctx,
+                    data_train=wf_train, data_val=wf_val,
                 )
                 window_seed_results.append(sr)
                 all_seed_results_flat.append(sr)
@@ -854,7 +1110,10 @@ def _run_single_ticker(
         print_summary_table(aggregated)
         print_ranking(aggregated)
         export_dashboard_results(
-            all_seed_results_flat, aggregated, results_dir=ticker_results_dir
+            all_seed_results_flat,
+            aggregated,
+            results_dir=ticker_results_dir,
+            seeds=cfg.seeds * cfg.wf_n_windows,
         )
 
         # Exportar métricas por ventana (incluyendo IVL provisional)
@@ -877,18 +1136,32 @@ def _run_single_ticker(
         data_is, data_oos = split_data(data, train_ratio=cfg.train_ratio)
         print(f"  IS: {len(data_is)} filas  |  OOS: {len(data_oos)} filas  |  n_features: {n_features}")
 
+        data_is, data_oos, data_train, data_val = _prepare_train_val_eval_splits(
+            data_is, data_oos, cfg
+        )
+        if cfg.use_internal_validation:
+            print(
+                f"  Validacion interna: train={len(data_train)} filas | "
+                f"val={len(data_val)} filas."
+            )
         if cfg.normalize_features and cfg.features:
-            data_is, data_oos, _ = normalize_is_oos(data_is, data_oos)
-            print("  Normalizacion z-score aplicada (ajuste en IS, sin leakage a OOS).")
+            fit_split = "IS_train" if cfg.use_internal_validation else "IS"
+            print(
+                f"  Normalizacion z-score aplicada (ajuste en {fit_split}, "
+                "sin leakage a validacion/OOS)."
+            )
 
         # Precomputa latentes para C y D una sola vez (antes del bucle de semillas)
-        frozen_ctx = _build_frozen_ctx(data_is, data_oos, cfg, d_encoder)
+        frozen_ctx = _build_frozen_ctx(
+            data_is, data_oos, cfg, d_encoder, data_train, data_val
+        )
 
         all_results = []
         for seed in cfg.seeds:
             seed_results = run_single_seed(
                 seed=seed, data_is=data_is, data_oos=data_oos, cfg=cfg,
                 frozen_ctx=frozen_ctx,
+                data_train=data_train, data_val=data_val,
             )
             all_results.append(seed_results)
 
@@ -905,7 +1178,13 @@ def _run_single_ticker(
     aggregated = aggregate_results(all_results)
     print_summary_table(aggregated)
     print_ranking(aggregated)
-    export_dashboard_results(all_results, aggregated, results_dir=ticker_results_dir)
+    export_dashboard_results(
+        all_results, aggregated, results_dir=ticker_results_dir, seeds=cfg.seeds
+    )
+    if cfg.use_internal_validation:
+        _export_validation_metrics(
+            all_results, cfg.seeds, ticker, cfg.dqn_hidden_dim, ticker_results_dir
+        )
 
     # IVL: solo recoge componentes crudas. La normalización y el export
     # se realizan en run_experiment, tras tener todos los tickers.

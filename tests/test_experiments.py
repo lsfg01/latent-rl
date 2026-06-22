@@ -251,6 +251,12 @@ class TestDetectTickers:
         (tmp_path / "agent_summary.csv").write_text(_summary_csv_content())
         assert _detect_tickers(tmp_path) == []
 
+    def test_nested_campaign_directories_are_not_detected_as_tickers(self, tmp_path):
+        campaign_ticker = tmp_path / "abcd_robust_h64" / "SPY"
+        campaign_ticker.mkdir(parents=True)
+        (campaign_ticker / "agent_summary.csv").write_text(_summary_csv_content())
+        assert _detect_tickers(tmp_path) == []
+
     def test_get_available_tickers_delegates_to_detect(self, tmp_path):
         spy = tmp_path / "SPY"
         spy.mkdir()

@@ -153,6 +153,18 @@ class ExperimentConfig:
     lookback_window:  int   = 10
     initial_balance:  float = 10_000.0
     transaction_cost: float = 0.001
+    random_start_train: bool = False
+    reward_mode: str = "equity_delta_initial"
+    reward_clip: Optional[float] = None
+    trade_penalty: float = 0.0
+
+    # -- Validacion temporal interna -----------------------------------------
+    use_internal_validation: bool = False
+    internal_val_ratio: float = 0.2
+    validation_eval_freq: int = 5
+    validation_patience: Optional[int] = None
+    validation_score_mdd_weight: float = 0.25
+    validation_score_trade_weight: float = 0.05
 
     # -- DQN ------------------------------------------------------------------
     dqn_lr:              float = 1e-3
@@ -164,6 +176,9 @@ class ExperimentConfig:
     dqn_epsilon_start:   float = 1.0
     dqn_epsilon_end:     float = 0.1
     dqn_epsilon_decay:   float = 0.995
+    dqn_weight_decay:    float = 0.0
+    dqn_grad_clip_norm:  Optional[float] = None
+    dqn_dropout:         float = 0.0
 
     # -- LatentDQN ------------------------------------------------------------
     latent_dim:              int        = 16
@@ -179,6 +194,10 @@ class ExperimentConfig:
     latent_epsilon_start:    float      = 1.0
     latent_epsilon_end:      float      = 0.1
     latent_epsilon_decay:    float      = 0.995
+    latent_weight_decay:     float      = 0.0
+    latent_grad_clip_norm:   Optional[float] = None
+    latent_q_dropout:        float      = 0.0
+    align_latent_q_with_dqn: bool       = False
 
     # -- Brazos experimentales ------------------------------------------------
     run_arms:             List[str]      = field(default_factory=lambda: ["A", "B", "C", "D"])
@@ -251,6 +270,20 @@ class ExperimentConfig:
 
     def __post_init__(self) -> None:
         """Valida los valores de configuracion al construir el objeto."""
+        if self.align_latent_q_with_dqn:
+            self.latent_lr = self.dqn_lr
+            self.latent_gamma = self.dqn_gamma
+            self.latent_q_hidden_dim = self.dqn_hidden_dim
+            self.latent_batch_size = self.dqn_batch_size
+            self.latent_buffer_capacity = self.dqn_buffer_capacity
+            self.latent_target_update = self.dqn_target_update
+            self.latent_epsilon_start = self.dqn_epsilon_start
+            self.latent_epsilon_end = self.dqn_epsilon_end
+            self.latent_epsilon_decay = self.dqn_epsilon_decay
+            self.latent_weight_decay = self.dqn_weight_decay
+            self.latent_grad_clip_norm = self.dqn_grad_clip_norm
+            self.latent_q_dropout = self.dqn_dropout
+
         if not self.tickers:
             raise ValueError("tickers no puede estar vacio")
         if any(not t or not t.strip() for t in self.tickers):
@@ -278,6 +311,34 @@ class ExperimentConfig:
             raise ValueError(
                 f"transaction_cost debe estar en [0, 1), got {self.transaction_cost}"
             )
+        if self.reward_mode not in {"equity_delta_initial", "log_return"}:
+            raise ValueError(
+                "reward_mode debe ser 'equity_delta_initial' o 'log_return'"
+            )
+        if self.reward_clip is not None and self.reward_clip <= 0:
+            raise ValueError("reward_clip debe ser > 0 cuando se especifica")
+        if self.trade_penalty < 0:
+            raise ValueError("trade_penalty debe ser >= 0")
+        if not 0.0 < self.internal_val_ratio < 1.0:
+            raise ValueError("internal_val_ratio debe estar en (0, 1)")
+        if self.validation_eval_freq < 1:
+            raise ValueError("validation_eval_freq debe ser >= 1")
+        if self.validation_patience is not None and self.validation_patience < 1:
+            raise ValueError("validation_patience debe ser >= 1 o None")
+        if self.validation_score_mdd_weight < 0:
+            raise ValueError("validation_score_mdd_weight debe ser >= 0")
+        if self.validation_score_trade_weight < 0:
+            raise ValueError("validation_score_trade_weight debe ser >= 0")
+        if self.dqn_weight_decay < 0 or self.latent_weight_decay < 0:
+            raise ValueError("weight_decay debe ser >= 0")
+        if self.dqn_grad_clip_norm is not None and self.dqn_grad_clip_norm <= 0:
+            raise ValueError("dqn_grad_clip_norm debe ser > 0 o None")
+        if self.latent_grad_clip_norm is not None and self.latent_grad_clip_norm <= 0:
+            raise ValueError("latent_grad_clip_norm debe ser > 0 o None")
+        if not 0.0 <= self.dqn_dropout < 1.0:
+            raise ValueError("dqn_dropout debe estar en [0, 1)")
+        if not 0.0 <= self.latent_q_dropout < 1.0:
+            raise ValueError("latent_q_dropout debe estar en [0, 1)")
         total_w = sum(self.ivl_weights.values())
         if abs(total_w - 1.0) > 1e-6:
             raise ValueError(

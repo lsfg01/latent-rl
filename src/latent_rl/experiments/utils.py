@@ -352,9 +352,10 @@ def export_dashboard_results(
     all_results: List[Dict[str, Dict[str, Dict[str, float]]]],
     aggregated: Dict[str, Dict[str, float]],
     results_dir: str | Path = "results",
+    seeds: Optional[List[int]] = None,
 ) -> None:
     """
-    Exporta los resultados en formato CSV para el dashboard y compute_ivl_from_results.py.
+    Exporta los resultados para el dashboard y ``scripts.utilities.compute_ivl``.
 
     Archivos generados:
 
@@ -389,6 +390,7 @@ def export_dashboard_results(
             "mean_equity_oos": metrics["mean_equity_oos"],
             "mean_n_trades":       metrics["mean_n_trades"],
             "seed_std_return_is":  metrics["seed_std_return_is"],
+            "seed_std_sharpe_oos": metrics["seed_std_sharpe_oos"],
         }
         for metrics in aggregated.values()
     ]
@@ -398,12 +400,16 @@ def export_dashboard_results(
 
     # 2. agent_seed_metrics.csv
     seed_rows = []
-    for seed_idx, seed_results in enumerate(all_results):
+    if seeds is not None and len(seeds) != len(all_results):
+        raise ValueError("seeds debe tener la misma longitud que all_results")
+    seed_values = seeds if seeds is not None else list(range(len(all_results)))
+    for seed, seed_results in zip(seed_values, all_results):
         for agent_name, splits in seed_results.items():
-            for split_name, metrics in splits.items():
+            for split_name in ("is", "oos"):
+                metrics = splits[split_name]
                 seed_rows.append({
                     "agent_name":     agent_name,
-                    "seed":           seed_idx,
+                    "seed":           seed,
                     "split":          split_name,
                     "total_reward":   metrics["total_reward"],
                     "total_return":   metrics["total_return"],
@@ -550,6 +556,37 @@ def normalize_is_oos(
     data_is_norm = normalizer.fit_transform(data_is)
     data_oos_norm = normalizer.transform(data_oos)
     return data_is_norm, data_oos_norm, normalizer
+
+
+def normalize_train_val_oos(
+    data_train: pd.DataFrame,
+    data_val: pd.DataFrame,
+    data_oos: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, FeatureNormalizer]:
+    """Ajusta en IS_train y aplica las mismas estadisticas a val y OOS."""
+    normalizer = FeatureNormalizer()
+    train_norm = normalizer.fit_transform(data_train)
+    val_norm = normalizer.transform(data_val)
+    oos_norm = normalizer.transform(data_oos)
+    return train_norm, val_norm, oos_norm, normalizer
+
+
+def split_internal_validation(
+    data_is: pd.DataFrame,
+    val_ratio: float = 0.2,
+    lookback: int = 1,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Divide IS cronologicamente en train/val y valida que ambos sean evaluables."""
+    split_idx = int(len(data_is) * (1.0 - val_ratio))
+    data_train = data_is.iloc[:split_idx].copy().reset_index(drop=True)
+    data_val = data_is.iloc[split_idx:].copy().reset_index(drop=True)
+    minimum = lookback + 2
+    if len(data_train) < minimum or len(data_val) < minimum:
+        raise ValueError(
+            "IS demasiado corto para validacion interna: "
+            f"train={len(data_train)}, val={len(data_val)}, minimo={minimum}"
+        )
+    return data_train, data_val
 
 
 def walk_forward_splits(

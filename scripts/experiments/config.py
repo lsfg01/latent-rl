@@ -1,12 +1,14 @@
 """
 Fuente única de verdad para las dos fases del experimento.
 
-Importar desde run_pretrain_encoder.py y run_latent_experiment.py para
+Importar desde los entrypoints de ``scripts.experiments`` para
 garantizar que el encoder de la Fase 1 (artefacto gordo) y el de la Fase 2
 (brazo C ligero + brazo D cargado) tengan exactamente la misma arquitectura.
 Si L, F o latent_dim difieren entre fases el artefacto falla ruidosamente
 al cargar; este módulo elimina esa posibilidad.
 """
+
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Ventana temporal y features  (deben coincidir en AMBAS fases)
@@ -45,3 +47,10 @@ LAMBDA_FORECAST = 0.5
 # ---------------------------------------------------------------------------
 EVAL_TICKERS     = ["SPY", "TSLA", "BTC-USD"]
 ENCODER_ARTIFACT = "models/encoders/tcn_heavy.pt"
+SMOKE_ENCODER_ARTIFACT = "models/smoke/encoders/tcn_heavy.pt"
+
+
+def default_results_dir(experiment: str, *, smoke: bool = False) -> str:
+    """Construye la ruta de salida estándar de una campaña."""
+    root = Path("results") / "smoke" if smoke else Path("results")
+    return str(root / experiment)

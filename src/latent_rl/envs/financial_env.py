@@ -28,6 +28,9 @@ class FinancialEnv(BaseFinancialEnv):
         render_mode: Optional[str] = None,
         feature_cols: Optional[List[str]] = None,
         price_col: str = "close",
+        reward_mode: str = "equity_delta_initial",
+        reward_clip: Optional[float] = None,
+        trade_penalty: float = 0.0,
     ):
         """
         Inicializa el entorno financiero.
@@ -42,16 +45,33 @@ class FinancialEnv(BaseFinancialEnv):
                 todas las columnas no-OHLCV; si no hay ninguna, usa OHLCV
                 completo (comportamiento heredado).
             price_col: Columna de precio para ejecución/equity (default "close").
+            reward_mode: "equity_delta_initial" (comportamiento heredado) o
+                "log_return" para usar el log-retorno del equity.
+            reward_clip: Si no es None, limita la recompensa a
+                ``[-reward_clip, reward_clip]``.
+            trade_penalty: Penalización aplicada solo a operaciones ejecutadas.
         """
         if len(data) < lookback_window:
             raise ValueError(
                 f"Datos insuficientes: se necesitan al menos {lookback_window} filas"
             )
+        if reward_mode not in {"equity_delta_initial", "log_return"}:
+            raise ValueError(
+                "reward_mode debe ser 'equity_delta_initial' o 'log_return', "
+                f"got {reward_mode!r}"
+            )
+        if reward_clip is not None and reward_clip <= 0:
+            raise ValueError("reward_clip debe ser > 0 cuando se especifica")
+        if trade_penalty < 0:
+            raise ValueError("trade_penalty debe ser >= 0")
 
         self.data = data.values
         self.initial_balance = initial_balance
         self.transaction_cost = transaction_cost
         self.lookback_window = lookback_window
+        self.reward_mode = reward_mode
+        self.reward_clip = reward_clip
+        self.trade_penalty = trade_penalty
 
         # --- Resolver índice de precio -------------------------------------------
         if price_col in data.columns:
@@ -105,10 +125,30 @@ class FinancialEnv(BaseFinancialEnv):
     # ------------------------------------------------------------------
 
     def reset(self, seed=None, options=None) -> Tuple[np.ndarray, Dict]:
-        if seed is not None:
-            np.random.seed(seed)
+        # BaseFinancialEnv.reset es abstracto y lanza NotImplementedError;
+        # llamamos directamente al reset de Gymnasium para inicializar np_random.
+        gym.Env.reset(self, seed=seed)
+        options = options or {}
 
         self.current_step = self.lookback_window
+        if options.get("random_start", False):
+            last_valid_start = len(self.data) - 2
+            max_steps = options.get("max_steps")
+            if max_steps is not None:
+                max_steps = max(int(max_steps), 0)
+                preferred_max = last_valid_start - max_steps
+            else:
+                preferred_max = last_valid_start
+
+            start_max = (
+                preferred_max
+                if preferred_max >= self.lookback_window
+                else last_valid_start
+            )
+            if start_max >= self.lookback_window:
+                self.current_step = int(
+                    self.np_random.integers(self.lookback_window, start_max + 1)
+                )
         self.cash = self.initial_balance
         self.position_units = 0.0
         self.position = 0
@@ -179,7 +219,7 @@ class FinancialEnv(BaseFinancialEnv):
         }
 
     def _execute_action(self, action: int, current_price: float) -> float:
-        current_equity = self._get_equity()
+        trade_executed = False
 
         if action == 1:  # Buy
             if self.position == 0:
@@ -193,6 +233,7 @@ class FinancialEnv(BaseFinancialEnv):
                     {"type": "buy", "price": current_price,
                      "units": self.position_units, "step": self.current_step}
                 )
+                trade_executed = True
 
         elif action == 2:  # Sell
             if self.position == 1:
@@ -208,15 +249,27 @@ class FinancialEnv(BaseFinancialEnv):
                 self.position_units = 0.0
                 self.position = 0
                 self.entry_price = 0.0
+                trade_executed = True
 
         new_equity = self._get_equity()
-        reward = (
-            (new_equity - self.previous_equity) / self.initial_balance
-            if self.previous_equity > 0
-            else 0.0
-        )
+        if self.reward_mode == "log_return":
+            eps = 1e-8
+            reward = float(
+                np.log((new_equity + eps) / (self.previous_equity + eps))
+            )
+        else:
+            reward = (
+                (new_equity - self.previous_equity) / self.initial_balance
+                if self.previous_equity > 0
+                else 0.0
+            )
+
+        if trade_executed:
+            reward -= self.trade_penalty
+        if self.reward_clip is not None:
+            reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
         self.previous_equity = new_equity
-        return reward
+        return float(reward)
 
     def _calculate_pnl(self, current_price: float) -> float:
         if self.position == 1:

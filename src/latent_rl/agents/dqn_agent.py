@@ -14,7 +14,13 @@ from latent_rl.agents.replay_buffer import ReplayBuffer
 class QNetwork(nn.Module):
     """Red neuronal Q simple MLP."""
 
-    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 128):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.0,
+    ):
         """
         Inicializa la red Q.
 
@@ -29,6 +35,7 @@ class QNetwork(nn.Module):
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -41,8 +48,8 @@ class QNetwork(nn.Module):
             Tensor de salida (batch, n_actions)
         """
         x = self.flatten(x)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = self.dropout(torch.relu(self.fc1(x)))
+        x = self.dropout(torch.relu(self.fc2(x)))
         x = self.fc3(x)
         return x
 
@@ -63,7 +70,10 @@ class DQNAgent(BaseAgent):
         buffer_capacity: int = 10000,
         target_update_freq: int = 100,
         hidden_dim: int = 128,
-        device: str = "cpu"
+        device: str = "cpu",
+        weight_decay: float = 0.0,
+        grad_clip_norm: Optional[float] = None,
+        dropout: float = 0.0,
     ):
         """
         Inicializa el agente DQN.
@@ -94,20 +104,27 @@ class DQNAgent(BaseAgent):
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
         self.device = torch.device(device)
+        self.grad_clip_norm = grad_clip_norm
 
         # Calcular dimensión de entrada (aplanar observación)
         self.input_dim = int(np.prod(observation_shape))
 
         # Crear redes Q
-        self.q_network = QNetwork(self.input_dim, self.n_actions, hidden_dim).to(self.device)
-        self.target_network = QNetwork(self.input_dim, self.n_actions, hidden_dim).to(self.device)
+        self.q_network = QNetwork(
+            self.input_dim, self.n_actions, hidden_dim, dropout=dropout
+        ).to(self.device)
+        self.target_network = QNetwork(
+            self.input_dim, self.n_actions, hidden_dim, dropout=dropout
+        ).to(self.device)
 
         # Inicializar target network con los mismos pesos
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()
 
         # Optimizador y loss
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(
+            self.q_network.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
         self.criterion = nn.SmoothL1Loss()
 
         # Replay buffer
@@ -137,10 +154,16 @@ class DQNAgent(BaseAgent):
             return self.action_space.sample()
         else:
             # Acción greedy
-            with torch.no_grad():
-                obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
-                q_values = self.q_network(obs_tensor)
-                return q_values.argmax().item()
+            was_training = self.q_network.training
+            if not training:
+                self.q_network.eval()
+            try:
+                with torch.no_grad():
+                    obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+                    q_values = self.q_network(obs_tensor)
+                    return q_values.argmax().item()
+            finally:
+                self.q_network.train(was_training)
 
     def store_transition(self, state: np.ndarray, action: int, reward: float,
                        next_state: np.ndarray, done: bool) -> None:
@@ -191,6 +214,10 @@ class DQNAgent(BaseAgent):
         # Optimizar
         self.optimizer.zero_grad()
         loss.backward()
+        if self.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.q_network.parameters(), self.grad_clip_norm
+            )
         self.optimizer.step()
 
         # Actualizar target network periódicamente

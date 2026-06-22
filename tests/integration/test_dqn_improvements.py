@@ -4,11 +4,12 @@ Usa datos sintéticos (sin internet) y un experimento corto para comprobar
 que todos los componentes nuevos funcionan correctamente.
 """
 
-import sys
-import traceback
 import numpy as np
 import pandas as pd
+import pytest
 import torch
+
+pytestmark = pytest.mark.integration
 
 # ── 1. Datos sintéticos ───────────────────────────────────────────────────────
 
@@ -27,30 +28,28 @@ def make_synthetic_data(n=300, seed=42):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def ok(msg):  print(f"  [OK]  {msg}")
-def fail(msg): print(f"  [FAIL] {msg}"); sys.exit(1)
+def ok(_msg):
+    """Conserva las anotaciones del antiguo verificador sin producir salida."""
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
-def test_dueling_qnetwork():
-    print("\n[1] DuelingQNetwork (LayerNorm + GELU + Dueling streams)")
-    from latent_rl.agents.dqn_agent import DuelingQNetwork
-    net = DuelingQNetwork(input_dim=50, output_dim=3, hidden_dim=64)
+def test_qnetwork():
+    from latent_rl.agents.dqn_agent import QNetwork
+    net = QNetwork(input_dim=50, output_dim=3, hidden_dim=64)
     x = torch.randn(8, 50)
     q = net(x)
     assert q.shape == (8, 3), f"Shape inesperado: {q.shape}"
     ok(f"output shape {q.shape} correcto")
 
-    # Verificar que los Q-values tienen estructura Dueling (no todos iguales)
+    # Verificar que la red produce valores no constantes.
     assert q.std().item() > 0, "Q-values son constantes, algo falla"
-    ok("Q-values no constantes — Dueling funciona")
+    ok("Q-values no constantes")
 
 
-def test_dueling_latent_qnetwork():
-    print("\n[2] DuelingLatentQNetwork")
-    from latent_rl.agents.latent_dqn_agent import DuelingLatentQNetwork
-    net = DuelingLatentQNetwork(latent_dim=32, output_dim=3, hidden_dim=64)
+def test_latent_qnetwork():
+    from latent_rl.agents.latent_dqn_agent import LatentQNetwork
+    net = LatentQNetwork(latent_dim=32, output_dim=3, hidden_dim=64)
     z = torch.randn(8, 32)
     q = net(z)
     assert q.shape == (8, 3)
@@ -58,7 +57,6 @@ def test_dueling_latent_qnetwork():
 
 
 def test_mlp_encoder_gelu():
-    print("\n[3] MLPLatentEncoder con activación GELU")
     from latent_rl.representations import MLPLatentEncoder
     enc = MLPLatentEncoder(input_dim=50, latent_dim=16, hidden_dims=[32, 16], activation="gelu")
     x = torch.randn(4, 50)
@@ -70,21 +68,24 @@ def test_mlp_encoder_gelu():
     ok(f"decode shape {r.shape} correcto")
 
 
-def test_conv1d_encoder():
-    print("\n[4] Conv1DLatentEncoder")
-    from latent_rl.representations import Conv1DLatentEncoder
+def test_tcn_encoder():
+    from latent_rl.representations import TCNLatentEncoder
 
-    enc = Conv1DLatentEncoder(
-        lookback_window=10, n_features=5, latent_dim=16,
-        channels=[16, 32], dropout=0.0
+    enc = TCNLatentEncoder(
+        input_len=10,
+        n_features=5,
+        latent_dim=16,
+        channels=16,
+        dilations=[1, 2, 4],
+        dropout=0.0,
     )
-    x = torch.randn(8, 50)  # (batch, lookback * features)
+    x = torch.randn(8, 10, 5)
     z = enc(x)
     assert z.shape == (8, 16), f"Encode shape inesperado: {z.shape}"
     ok(f"encode shape {z.shape} correcto")
 
     r = enc.decode(z)
-    assert r.shape == (8, 50), f"Decode shape inesperado: {r.shape}"
+    assert r.shape == (8, 10, 5), f"Decode shape inesperado: {r.shape}"
     ok(f"decode shape {r.shape} correcto")
 
     # Pérdida de reconstrucción debe ser finita
@@ -94,7 +95,6 @@ def test_conv1d_encoder():
 
 
 def test_dqn_agent_training():
-    print("\n[5] DQNAgent — ciclo de entrenamiento completo (Double DQN)")
     from gymnasium import spaces
     from latent_rl.agents import DQNAgent
     from latent_rl.envs import FinancialEnv
@@ -129,8 +129,7 @@ def test_dqn_agent_training():
     ok(f"Entrenamiento OK — {len(losses)} updates, loss_final={losses[-1]:.6f}")
 
 
-def test_latent_dqn_conv1d_training():
-    print("\n[6] LatentDQNAgent (Conv1D) — ciclo de entrenamiento completo (Double DQN)")
+def test_latent_dqn_tcn_training():
     from latent_rl.agents import LatentDQNAgent
     from latent_rl.envs import FinancialEnv
 
@@ -141,8 +140,9 @@ def test_latent_dqn_conv1d_training():
         action_space=env.action_space,
         observation_shape=env.observation_space.shape,
         latent_dim=16,
-        encoder_hidden_dims=[16, 32],
-        encoder_type="conv1d",
+        encoder_type="tcn",
+        tcn_dilations=[1, 2, 4],
+        tcn_channels=16,
         learning_rate=1e-3,
         q_hidden_dim=64,
         batch_size=16,
@@ -173,7 +173,6 @@ def test_latent_dqn_conv1d_training():
 
 
 def test_latent_dqn_mlp_training():
-    print("\n[7] LatentDQNAgent (MLP) — ciclo de entrenamiento")
     from latent_rl.agents import LatentDQNAgent
     from latent_rl.envs import FinancialEnv
 
@@ -212,7 +211,6 @@ def test_latent_dqn_mlp_training():
 
 
 def test_full_pipeline_synthetic():
-    print("\n[8] Pipeline completo — experimento mini con datos sintéticos")
     from latent_rl.experiments.config import ExperimentConfig
     from latent_rl.experiments.runner import run_single_seed
 
@@ -233,19 +231,21 @@ def test_full_pipeline_synthetic():
         dqn_batch_size=16,
         latent_dim=16,
         encoder_hidden_dims=[16, 32],
-        encoder_type="conv1d",
+        encoder_type="tcn",
+        tcn_dilations=[1, 2, 4],
+        tcn_channels=16,
         latent_q_hidden_dim=64,
         latent_buffer_capacity=500,
         latent_batch_size=16,
         pretrain_n_samples=50,
         pretrain_n_epochs=3,
+        run_arms=["A", "B", "C"],
     )
 
     results = run_single_seed(seed=0, data_is=data_is, data_oos=data_oos, cfg=cfg)
 
     expected_agents = [
-        "RandomAgent", "BuyAndHoldAgent", "DQNAgent",
-        "LatentDQNAgent (no pretrained)", "LatentDQNAgent (pretrained)",
+        "RandomAgent", "BuyAndHoldAgent", "A", "B", "C",
     ]
     for name in expected_agents:
         assert name in results, f"Agente '{name}' no en resultados"
@@ -257,15 +257,14 @@ def test_full_pipeline_synthetic():
 
 
 def test_config_new_fields():
-    print("\n[9] ExperimentConfig — nuevos campos y validación")
     from latent_rl.experiments.config import ExperimentConfig
 
     cfg = ExperimentConfig()
-    assert cfg.encoder_type == "conv1d"
-    assert cfg.dqn_hidden_dim == 256
-    assert cfg.latent_dim == 32
-    assert cfg.n_training_episodes == 50
-    assert cfg.pretrain_n_samples == 1_000
+    assert cfg.encoder_type == "tcn"
+    assert cfg.dqn_hidden_dim == 128
+    assert cfg.latent_dim == 16
+    assert cfg.n_training_episodes == 10
+    assert cfg.pretrain_n_samples == 100
     ok("Valores por defecto correctos")
 
     # Verificar que mlp también funciona
@@ -276,34 +275,3 @@ def test_config_new_fields():
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    tests = [
-        test_dueling_qnetwork,
-        test_dueling_latent_qnetwork,
-        test_mlp_encoder_gelu,
-        test_conv1d_encoder,
-        test_dqn_agent_training,
-        test_latent_dqn_conv1d_training,
-        test_latent_dqn_mlp_training,
-        test_full_pipeline_synthetic,
-        test_config_new_fields,
-    ]
-
-    passed = 0
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except Exception as e:
-            print(f"  [FALLO] {t.__name__}: {e}")
-            traceback.print_exc()
-            failed += 1
-
-    print(f"\n{'='*50}")
-    print(f"Resultado: {passed}/{len(tests)} tests pasados")
-    if failed:
-        print(f"  {failed} tests fallaron")
-        sys.exit(1)
-    else:
-        print("  Todos los tests pasaron correctamente.")

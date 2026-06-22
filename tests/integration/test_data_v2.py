@@ -7,14 +7,18 @@ Verificacion de las mejoras de datos v2:
   - Pipeline completo con normalizacion
 """
 
-import sys, traceback, tempfile
+import tempfile
+
 import numpy as np
 import pandas as pd
+import pytest
 from unittest.mock import patch
 
+pytestmark = pytest.mark.integration
 
-def ok(msg):   print(f"  [OK]  {msg}")
-def fail(msg): print(f"  [FAIL] {msg}"); sys.exit(1)
+
+def ok(_msg):
+    """Conserva las anotaciones del antiguo verificador sin producir salida."""
 
 
 # Datos sinteticos compartidos
@@ -34,7 +38,6 @@ def make_ohlcv(n=400, seed=42) -> pd.DataFrame:
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 def test_normalizer_no_leakage():
-    print("\n[1] FeatureNormalizer — sin leakage IS/OOS")
     from latent_rl.data.features import FeatureEngineer
     from latent_rl.data.normalizer import FeatureNormalizer
 
@@ -74,7 +77,6 @@ def test_normalizer_no_leakage():
 
 
 def test_walk_forward_splits():
-    print("\n[2] walk_forward_splits — ventanas correctas sin solapamiento")
     from latent_rl.experiments.utils import walk_forward_splits
 
     data = make_ohlcv(300)
@@ -83,31 +85,26 @@ def test_walk_forward_splits():
     assert len(splits) == 5, f"Esperadas 5 ventanas, got {len(splits)}"
     ok(f"Numero de ventanas: {len(splits)}")
 
-    # Verificar ratio IS/OOS en cada ventana
-    for i, (wf_is, wf_oos) in enumerate(splits):
-        total = len(wf_is) + len(wf_oos)
-        ratio = len(wf_is) / total
-        assert abs(ratio - 0.6) < 0.05, f"Ventana {i}: ratio IS={ratio:.2f} (esperado ~0.6)"
-        ok(f"Ventana {i+1}: IS={len(wf_is)}, OOS={len(wf_oos)}, ratio={ratio:.2f}")
+    # El ratio fija el ancla inicial; después el IS se expande con cada OOS.
+    assert len(splits[0][0]) == int(len(data) * 0.6)
+    for current, following in zip(splits, splits[1:]):
+        wf_is, wf_oos = current
+        next_is, _ = following
+        assert len(next_is) == len(wf_is) + len(wf_oos)
 
     # Sin solapamiento: los indices de ventanas consecutivas no se solapan
     # (comprobado indirectamente: ventana i empieza donde acaba i-1)
     splits2 = walk_forward_splits(data, n_windows=3, is_ratio=0.7)
-    total_rows = sum(len(is_) + len(oos_) for is_, oos_ in splits2)
-    assert total_rows == len(data), f"Perdida de filas: {total_rows} != {len(data)}"
-    ok(f"Sin perdida de filas: {total_rows} = {len(data)}")
+    total_oos = sum(len(oos_) for _, oos_ in splits2)
+    assert total_oos == len(data) - int(len(data) * 0.7)
 
     # Error con datos insuficientes
     tiny = make_ohlcv(15)
-    try:
+    with pytest.raises(ValueError):
         walk_forward_splits(tiny, n_windows=5)
-        fail("Deberia lanzar ValueError por datos insuficientes")
-    except ValueError as e:
-        ok(f"ValueError por datos insuficientes: {e}")
 
 
 def test_normalize_is_oos_util():
-    print("\n[3] normalize_is_oos() — funcion de utilidad")
     from latent_rl.data.features import FeatureEngineer
     from latent_rl.experiments.utils import normalize_is_oos
 
@@ -136,7 +133,6 @@ def test_normalize_is_oos_util():
 
 
 def test_config_new_fields():
-    print("\n[4] ExperimentConfig — nuevos campos v2")
     from latent_rl.experiments.config import ExperimentConfig, TickerConfig
 
     # Valores por defecto
@@ -164,18 +160,12 @@ def test_config_new_fields():
     ok("ExperimentConfig con WF habilitado OK")
 
     # WF invalido: menos de 2 ventanas
-    try:
+    with pytest.raises(ValueError):
         ExperimentConfig(tickers=["SPY"], wf_enabled=True, wf_n_windows=1)
-        fail("Deberia lanzar ValueError con wf_n_windows=1")
-    except ValueError as e:
-        ok(f"Validacion wf_n_windows<2: {e}")
 
     # WF invalido: is_ratio fuera de rango
-    try:
+    with pytest.raises(ValueError):
         ExperimentConfig(tickers=["SPY"], wf_enabled=True, wf_n_windows=3, wf_is_ratio=1.1)
-        fail("Deberia lanzar ValueError con wf_is_ratio>1")
-    except ValueError as e:
-        ok(f"Validacion wf_is_ratio out-of-range: {e}")
 
     # normalize_features=False desactiva normalizacion
     cfg_no_norm = ExperimentConfig(tickers=["SPY"], normalize_features=False)
@@ -184,7 +174,6 @@ def test_config_new_fields():
 
 
 def test_context_features_mocked():
-    print("\n[5] load_context_features — activos de contexto (mocked)")
     from latent_rl.experiments.utils import load_context_features
 
     df_mock_spy = make_ohlcv(300, seed=1)
@@ -206,8 +195,8 @@ def test_context_features_mocked():
                 primary_len=300,
             )
 
-    assert "spy_log_return" in ctx_df.columns, f"Columnas: {list(ctx_df.columns)}"
-    assert "qqq_log_return" in ctx_df.columns
+    assert "ctx_SPY_log_return" in ctx_df.columns, f"Columnas: {list(ctx_df.columns)}"
+    assert "ctx_QQQ_log_return" in ctx_df.columns
     assert len(ctx_df) == 300
     assert not ctx_df.isnull().any().any()
     ok(f"Columnas de contexto: {list(ctx_df.columns)}")
@@ -221,7 +210,6 @@ def test_context_features_mocked():
 
 
 def test_pipeline_with_normalization():
-    print("\n[6] Pipeline mini con normalizacion IS/OOS")
     from latent_rl.experiments.config import ExperimentConfig
     from latent_rl.experiments.runner import run_single_seed
     from latent_rl.experiments.utils import normalize_is_oos, split_data
@@ -249,7 +237,9 @@ def test_pipeline_with_normalization():
         dqn_batch_size=16,
         latent_dim=8,
         encoder_hidden_dims=[8, 16],
-        encoder_type="conv1d",
+        encoder_type="tcn",
+        tcn_dilations=[1, 2, 4],
+        tcn_channels=16,
         latent_q_hidden_dim=32,
         latent_buffer_capacity=200,
         latent_batch_size=16,
@@ -257,6 +247,7 @@ def test_pipeline_with_normalization():
         pretrain_n_epochs=2,
         features=["log_return", "volume_ratio"],
         normalize_features=True,
+        run_arms=["A", "B", "C"],
     )
 
     results = run_single_seed(
@@ -264,8 +255,7 @@ def test_pipeline_with_normalization():
     )
 
     expected_agents = [
-        "RandomAgent", "BuyAndHoldAgent", "DQNAgent",
-        "LatentDQNAgent (no pretrained)", "LatentDQNAgent (pretrained)",
+        "RandomAgent", "BuyAndHoldAgent", "A", "B", "C",
     ]
     for name in expected_agents:
         assert name in results
@@ -274,7 +264,6 @@ def test_pipeline_with_normalization():
 
 
 def test_walk_forward_full():
-    print("\n[7] Walk-Forward completo — 3 ventanas con normalizacion")
     from latent_rl.experiments.utils import walk_forward_splits, normalize_is_oos
     from latent_rl.experiments.runner import run_single_seed
     from latent_rl.experiments.config import ExperimentConfig
@@ -299,13 +288,16 @@ def test_walk_forward_full():
         dqn_batch_size=8,
         latent_dim=4,
         encoder_hidden_dims=[4, 8],
-        encoder_type="conv1d",
+        encoder_type="tcn",
+        tcn_dilations=[1, 2],
+        tcn_channels=8,
         latent_q_hidden_dim=16,
         latent_buffer_capacity=100,
         latent_batch_size=8,
         pretrain_n_samples=20,
         pretrain_n_epochs=2,
         features=["log_return"],
+        run_arms=["A"],
     )
 
     wf_results = []
@@ -321,31 +313,3 @@ def test_walk_forward_full():
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    tests = [
-        test_normalizer_no_leakage,
-        test_walk_forward_splits,
-        test_normalize_is_oos_util,
-        test_config_new_fields,
-        test_context_features_mocked,
-        test_pipeline_with_normalization,
-        test_walk_forward_full,
-    ]
-
-    passed = failed = 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except Exception as e:
-            print(f"  [FALLO] {t.__name__}: {e}")
-            traceback.print_exc()
-            failed += 1
-
-    print(f"\n{'=' * 50}")
-    print(f"Resultado: {passed}/{len(tests)} tests pasados")
-    if failed:
-        print(f"  {failed} fallaron")
-        sys.exit(1)
-    else:
-        print("  Todos los tests pasaron correctamente.")

@@ -92,11 +92,12 @@ results/
 ### Paso 3 — Recalcular el IVL (opcional)
 
 ```powershell
-python examples\compute_ivl_from_results.py
+python -m scripts.utilities.compute_ivl
 ```
 
-Lee los CSVs existentes y recalcula el IVL. Útil para explorar distintas
-ponderaciones sin volver a entrenar los agentes.
+Lee los CSVs existentes y recalcula el IVL. Para una campaña concreta, pasa
+`--results-dir results/<campaña>` y los nombres de sus brazos mediante
+`--direct-agent` y `--latent-agents`.
 
 ### Paso 4 — Dashboard
 
@@ -195,10 +196,13 @@ latent-rl/
 │   ├── experiments/     # ExperimentConfig, run_experiment, pipeline completo
 │   ├── analysis/        # LatentIndexAnalyzer (PCA, norm, first-component)
 │   └── data/            # CSVDataLoader, DataPreprocessor, YahooFinanceLoader
-├── examples/            # Scripts de experimentación listos para ejecutar
+├── scripts/
+│   ├── experiments/     # Campañas reproducibles del TFM
+│   └── utilities/       # Generación y análisis de resultados
+├── examples/            # Ejemplos didácticos de la API
 ├── dashboard/           # Dashboard Dash + Plotly (app.py)
-├── tests/               # 250+ tests unitarios
-├── results/             # CSVs generados — excluido de Git
+├── tests/               # Pruebas unitarias y de integración
+├── results/             # Salidas agrupadas por campaña — excluido de Git
 └── pyproject.toml
 ```
 

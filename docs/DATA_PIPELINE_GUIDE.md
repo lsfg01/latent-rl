@@ -297,7 +297,7 @@ python examples/uc5_full_data_pipeline.py
 Para el dashboard con datos reales:
 ```
 python examples/compare_agents_multiseed_experiment.py
-python examples/compute_ivl_from_results.py
+python -m scripts.utilities.compute_ivl
 python dashboard/app.py
 ```
 

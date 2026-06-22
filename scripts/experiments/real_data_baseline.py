@@ -5,8 +5,8 @@ Descarga SPY (2018-2024), aplica features tecnicos, normaliza IS/OOS
 y compara los 5 agentes con 3 semillas.
 
 Uso:
-    python run_real_experiment.py
-    python dashboard/app.py
+    python -m scripts.experiments.real_data_baseline
+    python dashboard/app.py --results-dir results/real_data_baseline
 """
 
 from latent_rl.experiments import ExperimentConfig, run_experiment
@@ -61,6 +61,7 @@ config = ExperimentConfig(
     latent_q_hidden_dim = 128,
     latent_buffer_capacity = 5_000,
     latent_epsilon_decay   = 0.998,
+    align_latent_q_with_dqn = True,
 
     # Preentrenamiento del encoder
     pretrain_n_samples = 500,
@@ -82,7 +83,7 @@ config = ExperimentConfig(
     },
 
     device      = "cpu",
-    results_dir = "results",
+    results_dir = "results/real_data_baseline",
 )
 
 if __name__ == "__main__":

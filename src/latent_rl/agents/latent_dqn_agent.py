@@ -15,15 +15,22 @@ from latent_rl.representations.factory import build_encoder
 class LatentQNetwork(nn.Module):
     """Red neuronal Q que opera sobre representaciones latentes."""
 
-    def __init__(self, latent_dim: int, output_dim: int, hidden_dim: int = 128):
+    def __init__(
+        self,
+        latent_dim: int,
+        output_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = self.dropout(torch.relu(self.fc1(x)))
+        x = self.dropout(torch.relu(self.fc2(x)))
         return self.fc3(x)
 
 
@@ -70,6 +77,9 @@ class LatentDQNAgent(BaseAgent):
         freeze_encoder: bool = False,
         precomputed_latents: bool = False,
         device: str = "cpu",
+        weight_decay: float = 0.0,
+        grad_clip_norm: Optional[float] = None,
+        q_dropout: float = 0.0,
     ):
         """
         Args:
@@ -94,6 +104,7 @@ class LatentDQNAgent(BaseAgent):
         self.device = torch.device(device)
         self.freeze_encoder = freeze_encoder
         self.precomputed_latents = precomputed_latents
+        self.grad_clip_norm = grad_clip_norm
 
         # Dimensiones de la observación (L, F)
         L, F = observation_shape[0], observation_shape[1] if len(observation_shape) > 1 else 1
@@ -134,10 +145,14 @@ class LatentDQNAgent(BaseAgent):
                 self.encoder.freeze()
 
         # Redes Q (idénticas independientemente del modo)
-        self.q_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(
+        self.q_network = LatentQNetwork(
+            latent_dim, self.n_actions, q_hidden_dim, dropout=q_dropout
+        ).to(
             self.device
         )
-        self.target_network = LatentQNetwork(latent_dim, self.n_actions, q_hidden_dim).to(
+        self.target_network = LatentQNetwork(
+            latent_dim, self.n_actions, q_hidden_dim, dropout=q_dropout
+        ).to(
             self.device
         )
         self.target_network.load_state_dict(self.q_network.state_dict())
@@ -150,7 +165,10 @@ class LatentDQNAgent(BaseAgent):
             trainable_params = list(self.encoder.parameters()) + list(
                 self.q_network.parameters()
             )
-        self.optimizer = optim.Adam(trainable_params, lr=learning_rate)
+        self._trainable_params = trainable_params
+        self.optimizer = optim.Adam(
+            trainable_params, lr=learning_rate, weight_decay=weight_decay
+        )
         self.criterion = nn.SmoothL1Loss()
 
         self.replay_buffer = ReplayBuffer(buffer_capacity, observation_shape)
@@ -173,15 +191,28 @@ class LatentDQNAgent(BaseAgent):
         if training and np.random.random() < self.epsilon:
             return self.action_space.sample()
 
-        with torch.no_grad():
-            obs = self._normalize_observation(observation)
-            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            if self.precomputed_latents:
-                # obs ya es el vector latente (latent_dim,); shape (1, latent_dim)
-                latent = obs_t
-            else:
-                latent = self.encoder(obs_t)
-            return self.q_network(latent).argmax().item()
+        q_was_training = self.q_network.training
+        encoder_was_training = (
+            self.encoder.training if isinstance(self.encoder, nn.Module) else None
+        )
+        if not training:
+            self.q_network.eval()
+            if isinstance(self.encoder, nn.Module):
+                self.encoder.eval()
+        try:
+            with torch.no_grad():
+                obs = self._normalize_observation(observation)
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+                if self.precomputed_latents:
+                    # obs ya es el vector latente (latent_dim,); shape (1, latent_dim)
+                    latent = obs_t
+                else:
+                    latent = self.encoder(obs_t)
+                return self.q_network(latent).argmax().item()
+        finally:
+            self.q_network.train(q_was_training)
+            if isinstance(self.encoder, nn.Module):
+                self.encoder.train(encoder_was_training)
 
     def store_transition(
         self,
@@ -236,6 +267,10 @@ class LatentDQNAgent(BaseAgent):
         loss = self.criterion(q_values, target_q)
         self.optimizer.zero_grad()
         loss.backward()
+        if self.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self._trainable_params, self.grad_clip_norm
+            )
         self.optimizer.step()
 
         self.update_step += 1

@@ -3,15 +3,19 @@ Verificación del pipeline de datos mejorado.
 Usa datos sintéticos + mock de Yahoo Finance para no necesitar internet.
 """
 
-import sys, traceback, tempfile, os
+import tempfile
+
 import numpy as np
 import pandas as pd
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+pytestmark = pytest.mark.integration
 
-def ok(msg):   print(f"  [OK]  {msg}")
-def fail(msg): print(f"  [FAIL] {msg}"); sys.exit(1)
+
+def ok(_msg):
+    """Conserva las anotaciones del antiguo verificador sin producir salida."""
 
 
 # ── Datos sintéticos ──────────────────────────────────────────────────────────
@@ -32,7 +36,6 @@ def make_ohlcv(n=300, seed=7) -> pd.DataFrame:
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 def test_feature_engineer():
-    print("\n[1] FeatureEngineer — todos los features")
     from latent_rl.data.features import FeatureEngineer, AVAILABLE_FEATURES
 
     df = make_ohlcv(200)
@@ -55,7 +58,6 @@ def test_feature_engineer():
 
 
 def test_feature_engineer_empty():
-    print("\n[2] FeatureEngineer — lista vacía devuelve OHLCV sin cambios")
     from latent_rl.data.features import FeatureEngineer
 
     df = make_ohlcv(100)
@@ -66,7 +68,6 @@ def test_feature_engineer_empty():
 
 
 def test_feature_engineer_subset():
-    print("\n[3] FeatureEngineer — subconjunto de features")
     from latent_rl.data.features import FeatureEngineer
 
     df = make_ohlcv(150)
@@ -87,7 +88,6 @@ def test_feature_engineer_subset():
 
 
 def test_datacache():
-    print("\n[4] DataCache — escritura y lectura de caché")
     from latent_rl.data.cache import DataCache
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -128,14 +128,13 @@ def test_datacache():
 
 
 def test_config_new_fields():
-    print("\n[5] ExperimentConfig — nuevos campos y TickerConfig")
     from latent_rl.experiments.config import ExperimentConfig, TickerConfig
 
     # Configuración básica con valores por defecto
     cfg = ExperimentConfig()
     assert cfg.cache_dir == ".data_cache"
     assert cfg.interval == "1d"
-    assert "log_return" in cfg.features
+    assert cfg.features == []
     ok(f"Valores por defecto OK — features={cfg.features}")
 
     # TickerConfig overrides
@@ -169,26 +168,20 @@ def test_config_new_fields():
     ok("Ticker sin TickerConfig hereda fechas globales")
 
     # Validación de features inválidos
-    try:
+    with pytest.raises(ValueError):
         ExperimentConfig(tickers=["SPY"], features=["feature_inexistente"])
-        fail("Debería haber lanzado ValueError por feature inválido")
-    except ValueError as e:
-        ok(f"Validación de features inválidos OK: {e}")
 
     # Validación de TickerConfig con ticker no en tickers
-    try:
+    with pytest.raises(ValueError):
         ExperimentConfig(
             tickers=["SPY"],
             ticker_configs=[TickerConfig("AAPL")]
         )
-        fail("Debería haber lanzado ValueError")
-    except ValueError as e:
-        ok(f"Validación de ticker_configs inválido OK: {e}")
 
 
 def test_load_yfinance_data_with_features():
-    print("\n[6] load_yfinance_data — integración con caché y features")
-    from latent_rl.experiments.utils import load_yfinance_data
+    from latent_rl.experiments.config import ExperimentConfig
+    from latent_rl.experiments.utils import load_ticker_with_config
 
     df_mock = make_ohlcv(200)
 
@@ -199,12 +192,14 @@ def test_load_yfinance_data_with_features():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         with patch("yfinance.download", side_effect=mock_download):
-            df = load_yfinance_data(
-                "SPY", "2020-01-01", "2023-12-31",
-                interval="1d",
+            cfg = ExperimentConfig(
+                tickers=["SPY"],
+                start_date="2020-01-01",
+                end_date="2023-12-31",
                 cache_dir=tmpdir,
                 features=["log_return", "volume_ratio"],
             )
+            df = load_ticker_with_config("SPY", cfg)
 
     assert "log_return"   in df.columns
     assert "volume_ratio" in df.columns
@@ -214,7 +209,6 @@ def test_load_yfinance_data_with_features():
 
 
 def test_pipeline_with_features():
-    print("\n[7] Pipeline completo — experimento mini con features técnicos")
     from latent_rl.experiments.config import ExperimentConfig
     from latent_rl.experiments.runner import run_single_seed
 
@@ -243,50 +237,24 @@ def test_pipeline_with_features():
         dqn_batch_size=16,
         latent_dim=8,
         encoder_hidden_dims=[8, 16],
-        encoder_type="conv1d",
+        encoder_type="tcn",
+        tcn_dilations=[1, 2, 4],
+        tcn_channels=16,
         latent_q_hidden_dim=32,
         latent_buffer_capacity=200,
         latent_batch_size=16,
         pretrain_n_samples=30,
         pretrain_n_epochs=2,
         features=["log_return", "volume_ratio"],  # para que cfg sea consistente
+        run_arms=["A", "B", "C"],
     )
 
     results = run_single_seed(seed=0, data_is=data_is, data_oos=data_oos, cfg=cfg)
 
-    for name in ["RandomAgent", "BuyAndHoldAgent", "DQNAgent",
-                 "LatentDQNAgent (no pretrained)", "LatentDQNAgent (pretrained)"]:
+    for name in ["RandomAgent", "BuyAndHoldAgent", "A", "B", "C"]:
         assert name in results
         ok(f"{name}: IS={results[name]['is']['total_return']:.4f}  OOS={results[name]['oos']['total_return']:.4f}")
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    tests = [
-        test_feature_engineer,
-        test_feature_engineer_empty,
-        test_feature_engineer_subset,
-        test_datacache,
-        test_config_new_fields,
-        test_load_yfinance_data_with_features,
-        test_pipeline_with_features,
-    ]
-
-    passed = failed = 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except Exception as e:
-            print(f"  [FALLO] {t.__name__}: {e}")
-            traceback.print_exc()
-            failed += 1
-
-    print(f"\n{'='*50}")
-    print(f"Resultado: {passed}/{len(tests)} tests pasados")
-    if failed:
-        print(f"  {failed} fallaron")
-        sys.exit(1)
-    else:
-        print("  Todos los tests pasaron correctamente.")

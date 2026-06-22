@@ -66,35 +66,17 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Data files
+# Generated data and artifacts
 /data/
-*.csv
-*.parquet
-*.pkl
-*.pth
-
-# Logs
-logs/
+/.data_cache/
+/results/
+/models/
+/reports/
+/logs/
 *.log
 # Claude Code local files
 .claude/
 
 docs/tfm.pdf
 docs/tfm_extracted.txt
-
 extract_pdf.py
-
-docs/tfm.pdf
-docs/tfm_extracted.txt
-
-models/
-*.pth
-*.pt
-*.ckpt
-# Generated dashboard outputs
-reports/
-results/
-models/
-
-# Local data cache (pipeline datos, Phase 5)
-.data_cache/

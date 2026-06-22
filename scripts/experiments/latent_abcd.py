@@ -9,13 +9,13 @@ Brazos:
 
 Uso:
     # Smoke-run (validar flujo end-to-end sin coste de tiempo)
-    python run_latent_experiment.py --smoke
+    python -m scripts.experiments.latent_abcd --smoke
 
     # Experimento real (5 semillas × 3 tickers × 4 brazos)
-    python run_latent_experiment.py
+    python -m scripts.experiments.latent_abcd
 
     # Walk-forward complementario
-    python run_latent_experiment.py --wf --results-dir results_wf
+    python -m scripts.experiments.latent_abcd --wf
 """
 
 import argparse
@@ -23,11 +23,12 @@ import logging
 from pathlib import Path
 
 from latent_rl.experiments import ExperimentConfig, TickerConfig, run_experiment
-from experiments_config.shared_settings import (
+from scripts.experiments.config import (
     LOOKBACK, FEATURES, ENCODER_TYPE, LATENT_DIM,
     TCN_KERNEL, TCN_DILATIONS, TCN_CHANNELS,
     K_FORECAST, LAMBDA_FORECAST,
-    EVAL_TICKERS, ENCODER_ARTIFACT,
+    EVAL_TICKERS, ENCODER_ARTIFACT, SMOKE_ENCODER_ARTIFACT,
+    default_results_dir,
 )
 
 
@@ -103,9 +104,12 @@ def _check_norm_stats(cfg: ExperimentConfig) -> None:
 def build_config(
     smoke: bool = False,
     wf: bool = False,
-    results_dir: str = "results",
+    results_dir: str | None = None,
 ) -> ExperimentConfig:
     """Devuelve ExperimentConfig usando las constantes compartidas."""
+
+    experiment_name = "latent_abcd_wf" if wf else "latent_abcd"
+    results_dir = results_dir or default_results_dir(experiment_name, smoke=smoke)
 
     if smoke:
         return ExperimentConfig(
@@ -145,6 +149,7 @@ def build_config(
             latent_q_hidden_dim=64,
             latent_buffer_capacity=500,
             latent_epsilon_decay=0.99,
+            align_latent_q_with_dqn=True,
             # Preentrenamiento brazo C (smoke: épocas mínimas)
             pretrain_n_epochs=3,
             pretrain_lr=5e-4,
@@ -152,7 +157,7 @@ def build_config(
             pretrain_lambda_forecast=LAMBDA_FORECAST,
             pretrain_k_forecast=K_FORECAST,
             # Brazo D
-            heavy_encoder_path=ENCODER_ARTIFACT,
+            heavy_encoder_path=SMOKE_ENCODER_ARTIFACT,
             run_arms=["A", "B", "C", "D"],
             # IVL
             direct_agent="A",
@@ -203,6 +208,7 @@ def build_config(
         latent_q_hidden_dim=128,
         latent_buffer_capacity=5_000,
         latent_epsilon_decay=0.998,
+        align_latent_q_with_dqn=True,
         # Preentrenamiento brazo C (ligero, mismo objetivo que Fase 1)
         pretrain_n_epochs=30,
         pretrain_lr=5e-4,
@@ -235,8 +241,8 @@ def main() -> None:
         help="Walk-forward Analysis en lugar del split estándar IS/OOS",
     )
     parser.add_argument(
-        "--results-dir", default="results",
-        help="Directorio de salida de resultados (default: results/)",
+        "--results-dir", default=None,
+        help="Directorio de salida (default: results/<campaña>/)",
     )
     args = parser.parse_args()
 
@@ -275,7 +281,8 @@ def main() -> None:
         if not artifact.exists():
             print(
                 f"  AVISO: Artefacto gordo no encontrado en '{artifact}'. "
-                "El brazo D será omitido. Ejecuta run_pretrain_encoder.py primero."
+                "El brazo D será omitido. Ejecuta primero "
+                "python -m scripts.experiments.pretrain_encoder."
             )
 
     run_experiment(cfg)

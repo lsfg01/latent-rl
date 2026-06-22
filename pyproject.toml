@@ -3,7 +3,7 @@ name = "latent-rl"
 version = "0.1.0"
 description = "Plataforma experimental para RL financiero con representaciones latentes"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "TFM Author", email = "author@example.com"}
@@ -35,3 +35,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    "integration: synthetic end-to-end and component integration tests",
+]

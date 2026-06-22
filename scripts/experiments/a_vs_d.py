@@ -7,13 +7,13 @@ y congelado (brazo D). El encoder gordo se carga de `models/encoders/tcn_heavy.p
 
 Uso:
     # Smoke-run (validar carga de artefacto y flujo completo, 1 semilla)
-    python run_experiment_A_D.py --smoke
+    python -m scripts.experiments.a_vs_d --smoke
 
     # Experimento real (5 semillas x 3 tickers)
-    python run_experiment_A_D.py
+    python -m scripts.experiments.a_vs_d
 
     # Walk-forward complementario
-    python run_experiment_A_D.py --wf --results-dir results_A_D_wf
+    python -m scripts.experiments.a_vs_d --wf
 """
 
 import argparse
@@ -21,16 +21,17 @@ import logging
 from pathlib import Path
 
 from latent_rl.experiments import ExperimentConfig, TickerConfig, run_experiment
-from experiments_config.shared_settings import (
+from scripts.experiments.config import (
     LOOKBACK, FEATURES, ENCODER_TYPE, LATENT_DIM,
     TCN_KERNEL, TCN_DILATIONS, TCN_CHANNELS,
     K_FORECAST, LAMBDA_FORECAST,
-    EVAL_TICKERS, ENCODER_ARTIFACT,
+    EVAL_TICKERS, ENCODER_ARTIFACT, SMOKE_ENCODER_ARTIFACT,
+    default_results_dir,
 )
 
 
 # ---------------------------------------------------------------------------
-# Diagnóstico de normalización (igual que en run_latent_experiment.py)
+# Diagnóstico de normalización compartido con la campaña A/B/C/D.
 # ---------------------------------------------------------------------------
 
 def _check_norm_stats(cfg: ExperimentConfig) -> None:
@@ -91,9 +92,12 @@ def _check_norm_stats(cfg: ExperimentConfig) -> None:
 def build_config(
     smoke: bool = False,
     wf: bool = False,
-    results_dir: str = "results_A_D",
+    results_dir: str | None = None,
 ) -> ExperimentConfig:
     """Config para el experimento A vs D."""
+
+    experiment_name = "a_vs_d_wf" if wf else "a_vs_d"
+    results_dir = results_dir or default_results_dir(experiment_name, smoke=smoke)
 
     if smoke:
         return ExperimentConfig(
@@ -131,8 +135,9 @@ def build_config(
             latent_q_hidden_dim=64,
             latent_buffer_capacity=500,
             latent_epsilon_decay=0.99,
+            align_latent_q_with_dqn=True,
             # Brazo D
-            heavy_encoder_path=ENCODER_ARTIFACT,
+            heavy_encoder_path=SMOKE_ENCODER_ARTIFACT,
             run_arms=["A", "D"],
             # IVL: A vs D
             direct_agent="A",
@@ -179,6 +184,7 @@ def build_config(
         latent_q_hidden_dim=128,
         latent_buffer_capacity=5_000,
         latent_epsilon_decay=0.998,
+        align_latent_q_with_dqn=True,
         # Brazo D — artefacto gordo de Fase 1
         heavy_encoder_path=ENCODER_ARTIFACT,
         run_arms=["A", "D"],
@@ -205,8 +211,8 @@ def main() -> None:
         help="Walk-forward en lugar del split IS/OOS estandar",
     )
     parser.add_argument(
-        "--results-dir", default="results_A_D",
-        help="Directorio de salida (default: results_A_D/)",
+        "--results-dir", default=None,
+        help="Directorio de salida (default: results/<campaña>/)",
     )
     args = parser.parse_args()
 
@@ -242,7 +248,8 @@ def main() -> None:
     if not artifact.exists():
         print(
             f"  ERROR: Artefacto gordo no encontrado en '{artifact}'. "
-            "El brazo D no puede ejecutarse. Regenera la Fase 1 con run_pretrain_encoder.py."
+            "El brazo D no puede ejecutarse. Regenera la Fase 1 con "
+            "python -m scripts.experiments.pretrain_encoder."
         )
         return
 

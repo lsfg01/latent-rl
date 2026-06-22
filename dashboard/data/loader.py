@@ -153,7 +153,7 @@ def load_ivl_results(
     if not csv_path.exists():
         return None, (
             f"No se encontro {csv_path}\n"
-            "Ejecuta: python examples/compute_ivl_from_results.py"
+            "Ejecuta: python -m scripts.utilities.compute_ivl"
         )
     try:
         return pd.read_csv(csv_path), None

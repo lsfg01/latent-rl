@@ -7,22 +7,21 @@ arquitectura (L, F, latent_dim, dilations…) o el corpus.
 
 Uso:
     # Smoke-run rápido para validar el flujo de punta a punta
-    python run_pretrain_encoder.py --smoke
+    python -m scripts.experiments.pretrain_encoder --smoke
 
     # Entrenamiento real (tarda ~15-30 min según hardware)
-    python run_pretrain_encoder.py
+    python -m scripts.experiments.pretrain_encoder
 """
 
 import argparse
 import logging
-import sys
 
 from latent_rl.pretraining import PretrainConfig, pretrain_offline
-from experiments_config.shared_settings import (
+from scripts.experiments.config import (
     LOOKBACK, FEATURES, ENCODER_TYPE, LATENT_DIM,
     TCN_KERNEL, TCN_DILATIONS, TCN_CHANNELS,
     K_FORECAST, LAMBDA_FORECAST,
-    EVAL_TICKERS, ENCODER_ARTIFACT,
+    EVAL_TICKERS, ENCODER_ARTIFACT, SMOKE_ENCODER_ARTIFACT,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,7 +50,10 @@ UNIVERSE = [
 # Construcción de la configuración
 # ---------------------------------------------------------------------------
 
-def build_config(smoke: bool = False) -> PretrainConfig:
+def build_config(
+    smoke: bool = False,
+    output_path: str | None = None,
+) -> PretrainConfig:
     """Devuelve PretrainConfig para entrenamiento real o smoke-run."""
     if smoke:
         return PretrainConfig(
@@ -77,7 +79,7 @@ def build_config(smoke: bool = False) -> PretrainConfig:
             early_stopping_patience=3,
             min_asset_length=100,
             seed=42,
-            output_path=ENCODER_ARTIFACT,
+            output_path=output_path or SMOKE_ENCODER_ARTIFACT,
         )
 
     return PretrainConfig(
@@ -108,7 +110,7 @@ def build_config(smoke: bool = False) -> PretrainConfig:
         early_stopping_patience=10,
         min_asset_length=250,
         seed=42,
-        output_path=ENCODER_ARTIFACT,
+        output_path=output_path or ENCODER_ARTIFACT,
     )
 
 
@@ -122,6 +124,11 @@ def main() -> None:
         "--smoke", action="store_true",
         help="Smoke-run con parámetros mínimos para validar el flujo end-to-end",
     )
+    parser.add_argument(
+        "--output-path",
+        default=None,
+        help="Ruta del artefacto (por defecto separa modelos smoke y reales)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -130,7 +137,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    cfg = build_config(smoke=args.smoke)
+    cfg = build_config(smoke=args.smoke, output_path=args.output_path)
 
     print("=" * 70)
     print(f"{'SMOKE RUN' if args.smoke else 'ENTRENAMIENTO REAL'}")
