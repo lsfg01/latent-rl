@@ -1,136 +1,263 @@
-# Upgrade del Encoder Latente (familia de arquitecturas + artefactos)
+# Elección y evaluación del encoder latente
 
-> Contexto de la sesión: commit `encoder robusto` (`e9f6a22`). Este documento resume
-> el rediseño del subsistema `representations/`: de un único `MLPLatentEncoder` plano
-> a una **familia de encoders temporales** (MLP / TCN / GRU) construidos por factory,
-> con un **sistema de artefactos** autocontenido para encoders preentrenados.
+## 1. Decisión experimental
 
-## Objetivo
+El encoder transforma una ventana financiera de forma `(30 sesiones, 8 variables)` en
+un vector latente de 32 dimensiones. Su función no es decidir la acción, sino determinar
+qué información del estado queda disponible para que la política la aprenda.
 
-Antes del upgrade, la única representación latente era un MLP que aplanaba la ventana
-`(L, F)` a un vector `L·F`, perdiendo toda la estructura temporal. El objetivo del
-upgrade es:
+La pregunta relevante no es “qué arquitectura es más sofisticada”, sino:
 
-1. Tratar la observación como **serie temporal** `(N, L, F)` y dejar que el encoder
-   modele la dinámica (no solo correlaciones estáticas entre posiciones aplanadas).
-2. Poder intercambiar la arquitectura del encoder (`mlp` / `tcn` / `gru`) sin tocar
-   el agente ni el pipeline, solo cambiando `encoder_type` en la configuración.
-3. Persistir un encoder preentrenado como **artefacto reutilizable** que lleva su
-   propia arquitectura, estadísticas de normalización y procedencia, de modo que
-   cargarlo en un experimento distinto sea seguro y falle ruidosamente si es
-   incompatible.
+> ¿Qué sesgo inductivo produce una representación más transferible, estable y útil para
+> el aprendizaje RL fuera de muestra bajo un presupuesto comparable?
 
-## Arquitectura del módulo
+La campaña robusta utiliza una TCN como arquitectura principal. MLP y GRU permanecen como
+baselines y ablaciones necesarias para saber si una posible mejora procede del modelado
+temporal o simplemente de cambiar capacidad y número de parámetros.
 
+---
+
+## 2. Alternativas arquitectónicas
+
+| Arquitectura | Supuesto principal | Ventajas | Riesgos | Papel experimental |
+|---|---|---|---|---|
+| **MLP** | Cada posición de la ventana puede tratarse como una coordenada del vector | Simple, rápida y fácil de controlar | No representa explícitamente localidad ni orden temporal | Baseline de compresión sin sesgo temporal fuerte |
+| **TCN causal** | Los patrones locales a distintas escalas son informativos | Paralelizable, campo receptivo explícito, causalidad clara | Depende de kernel/dilataciones; puede sobredimensionarse | Arquitectura principal de la campaña robusta |
+| **GRU** | Un estado recurrente puede resumir dependencias secuenciales | Longitud flexible y memoria temporal aprendida | Entrenamiento secuencial, mayor sensibilidad y coste | Ablación recurrente frente a la TCN |
+
+### MLP
+
+El MLP aplana las 30 × 8 entradas. Puede aprender interacciones entre cualquier par de
+posiciones, pero no incorpora que dos días contiguos están más relacionados que dos
+posiciones alejadas. Si un MLP iguala a TCN/GRU bajo capacidad comparable, el beneficio
+del encoder podría provenir principalmente del cuello de botella y no del modelado
+temporal.
+
+### TCN causal
+
+La TCN aplica convoluciones que solo usan el presente y el pasado. Las dilataciones
+permiten combinar patrones de pocos días con señales distribuidas por toda la ventana.
+Su campo receptivo es verificable antes de entrenar:
+
+```text
+RF = 1 + (kernel_size − 1) · Σ dilataciones
 ```
-representations/
-├── base.py          # LatentEncoder (ABC): contrato común
-├── mlp_encoder.py   # MLPLatentEncoder  (compatibilidad + decoder (L,F))
-├── tcn_encoder.py   # TCNLatentEncoder  (convoluciones causales dilatadas)
-├── gru_encoder.py   # GRULatentEncoder  (recurrente)
-├── factory.py       # build_encoder(encoder_type, **kwargs)
-└── artifact.py      # save_encoder_artifact / load_encoder_artifact
-```
 
-## Contrato común: `LatentEncoder` (base.py)
+Con kernel 3 y dilataciones `[1,2,4,8]`, `RF=31`, suficiente para cubrir una ventana de
+30 sesiones. Una TCN con `RF<lookback` no observa conjuntamente toda la historia y cambia
+la hipótesis experimental, aunque el modelo siga ejecutándose.
 
-Clase base abstracta (`nn.Module` + `ABC`). Define la interfaz que todo encoder debe
-cumplir, lo que permite que agente, pretrainer y sistema de artefactos sean agnósticos
-a la arquitectura concreta:
+### GRU
 
-- `forward(x) -> (N, latent_dim)`: codifica `(N, L, F)` o `(N, input_dim)` al latente.
-- `decode(z)`: reconstruye la entrada (necesario para la pérdida de reconstrucción).
-- `get_arch_config() -> Dict`: devuelve `encoder_type` + kwargs de arquitectura.
-  Es la pieza clave que permite **reconstruir el encoder desde un artefacto**.
-- `encode` (alias de forward), `reconstruction_loss` (MSE recon, aplana si hace falta).
-- `freeze()` / `unfreeze()`: congelan/descongelan todos los parámetros y fijan
-  `is_frozen`. Usado por los brazos C y D (encoder congelado).
+La GRU actualiza un estado al recorrer la ventana. Puede aprender qué información
+recordar u olvidar, sin fijar manualmente escalas temporales. A cambio, su optimización es
+menos paralela y su estado final puede dar un peso excesivo a las observaciones más
+recientes. Debe compararse con varias semillas y un presupuesto equivalente.
 
-## Las tres arquitecturas
+---
 
-### MLPLatentEncoder (mlp_encoder.py)
+## 3. Configuración de referencia y razones
 
-Encoder MLP retrocompatible. Acepta entrada plana `(N, input_dim)` **o** secuencial
-`(N, L, F)` (aplana internamente). Novedad respecto a la versión previa: si se construye
-con `input_len` y `n_features`, el **decoder devuelve `(N, L, F)`** en lugar de un vector
-plano, homogeneizando la forma de salida con TCN/GRU. Mantiene métodos finos de
-congelado (`freeze_encoder`/`freeze_decoder`, `get_encoder_parameters`, …) para
-compatibilidad con el `AutoencoderTrainer` legado. Activaciones soportadas: relu, tanh,
-sigmoid, leaky_relu, gelu.
+| Parámetro | Valor | Qué determina | Justificación actual |
+|---|---:|---|---|
+| `encoder_type` | `tcn` | Sesgo arquitectónico | Causalidad y cobertura temporal explícita. |
+| `lookback_window` | 30 | Historia disponible | Aproximadamente un mes y medio de sesiones. |
+| Número de variables | 8 | Anchura informativa por sesión | Combina retorno, volatilidad, momentum, volumen y régimen. |
+| `latent_dim` | 32 | Capacidad del cuello de botella | Reduce 240 entradas a 32 valores sin imponer una compresión extrema. |
+| `tcn_kernel_size` | 3 | Extensión local de cada filtro | Captura patrones cortos con coste moderado. |
+| `tcn_dilations` | `[1,2,4,8]` | Escalas y campo receptivo | Cubre la ventana completa con crecimiento exponencial. |
+| `tcn_channels` | 64 | Capacidad interna | Da margen al preentrenamiento offline sobre un corpus amplio. |
+| Activación | ReLU | Forma de la no linealidad | Estable, sencilla y fácil de reproducir. |
+| Dropout del encoder | 0.0 | Regularización estocástica | Se mantiene fuera de la campaña principal al no estar calibrado. |
 
-### TCNLatentEncoder (tcn_encoder.py)
+La compresión es aproximadamente `240 / 32 = 7,5`. Una dimensión de 32 no es un óptimo
+teórico: pretende ser lo bastante pequeña para forzar síntesis y lo bastante grande para
+retener señales heterogéneas.
 
-Encoder temporal con **convoluciones 1D causales y dilatadas** (Temporal Convolutional
-Network). Es el encoder por defecto de los experimentos robustos.
+La TCN de 64 canales se utiliza tanto en C como en D en la campaña robusta. La etiqueta
+“offline/heavy” de D describe sobre todo un preentrenamiento más amplio —39 activos y un
+presupuesto mayor—, no una arquitectura distinta. Esto hace que C frente a D compare con
+mayor limpieza especialización IS y transferencia offline.
 
-- Bloque base `_CausalResBlock`: `Conv1d` dilatada con **padding causal izquierdo**
-  `(kernel_size-1)·dilation` (no ve el futuro), `LayerNorm` sobre canal, activación,
-  dropout y **conexión residual** (skip 1×1 si cambian los canales).
-- Entrada `(N, L, F)` → transpone a `(N, F, L)` para `Conv1d` → pila de bloques con
-  dilataciones crecientes → proyección lineal del **último paso temporal** (causal) a
-  `latent_dim`.
-- Decoder MVP: lineal `latent_dim → L·F`, reshape a `(N, L, F)`.
-- **Campo receptivo** `RF = 1 + (K-1)·Σ dilations`. Si `RF < L` emite un `warning`
-  (la ventana no se cubre por completo). En la run robusta se eligió
-  `dilations=[1,2,4,8]`, `K=3` → `RF = 1 + 2·15 = 31 ≥ L=30` (cobertura completa).
+---
 
-### GRULatentEncoder (gru_encoder.py)
+## 4. Qué hace cada parámetro y cómo decidir su ajuste
 
-Encoder recurrente. `nn.GRU(batch_first=True)` sobre `(N, L, F)`; toma el **último
-estado oculto** de la última capa y lo proyecta a `latent_dim`. Decoder lineal análogo
-al de la TCN. Pensado como alternativa/ablación frente a la TCN.
+### Ventana temporal: `lookback_window`
 
-## Factory: `build_encoder` (factory.py)
+- **Más corta**: reacciona a cambios recientes y reduce complejidad, pero puede perder
+  régimen y persistencia.
+- **Más larga**: aporta contexto, aunque mezcla patrones de distintas épocas y exige más
+  capacidad.
+- **Diagnóstico**: comparar 10/20/30/60 sesiones manteniendo el campo receptivo completo y
+  reportar rendimiento por régimen, no solo promedio.
 
-Punto único de construcción. `build_encoder(encoder_type, **kwargs)` despacha a la clase
-concreta según `"mlp" | "tcn" | "gru"` y normaliza nombres de argumentos
-(`L`/`F` ↔ `input_len`/`n_features`; para MLP deriva `input_dim = L·F` si no se da).
-Lanza `ValueError` con tipos desconocidos. `encoder_kwargs_from_config(arch_config)`
-extrae los kwargs de un `arch_config` de artefacto descartando claves no constructoras
-(`encoder_type`, `feature_names`).
+### Dimensión latente: `latent_dim`
 
-Esto es lo que permite que el agente y la config solo manejen `encoder_type` + kwargs,
-sin importar la clase concreta.
+- **Más pequeña**: regulariza y facilita la cabeza Q; puede eliminar señales útiles.
+- **Más grande**: conserva más información; puede convertirse en una transformación casi
+  identitaria y aumentar la varianza RL.
+- **Diagnóstico**: evaluar reconstrucción, forecasting y resultados OOS para 16/32/64. Una
+  menor pérdida de reconstrucción no basta para preferir una dimensión.
 
-## Sistema de artefactos (artifact.py)
+### Canales TCN: `tcn_channels`
 
-Un **artefacto** es un `.pt` autocontenido con cuatro piezas:
+- Controlan cuántos patrones puede representar cada escala temporal.
+- Aumentarlos eleva capacidad y coste; también puede favorecer a TCN frente a MLP/GRU por
+  puro número de parámetros.
+- Una comparación arquitectónica rigurosa debería informar parámetros entrenables y, si
+  es posible, incluir una variante aproximadamente igualada en tamaño.
 
-| Clave | Contenido |
+### Kernel: `tcn_kernel_size`
+
+- Un kernel mayor mezcla más sesiones consecutivas en cada bloque.
+- Aumenta el campo receptivo, pero puede suavizar patrones cortos y elevar coste.
+- Debe elegirse junto con las dilataciones; cambiar uno sin recalcular `RF` puede generar
+  una cobertura accidentalmente distinta.
+
+### Dilataciones: `tcn_dilations`
+
+- Determinan las escalas temporales observadas.
+- Una progresión exponencial cubre historia larga con pocos bloques.
+- Añadir niveles más allá de la ventana no aporta nueva historia y sí añade capacidad.
+- El criterio mínimo es `RF ≥ lookback`; después debe validarse si la capacidad adicional
+  mejora OOS y no solo el objetivo auxiliar.
+
+### Dropout del encoder
+
+- Puede reducir coadaptación en corpus pequeños.
+- En encoders congelados, el ruido durante preentrenamiento cambia los pesos finales pero
+  no actúa durante RL.
+- Debe ajustarse en el protocolo de preentrenamiento, no a partir del OOS del agente.
+
+### Parámetros GRU
+
+| Parámetro | Función | Riesgo al aumentarlo |
+|---|---|---|
+| `gru_hidden_dim` | Capacidad del estado recurrente | Más coste y posible memorización del corpus. |
+| `gru_num_layers` | Profundidad temporal | Optimización más difícil y mayor sensibilidad a regularización. |
+
+### Capas ocultas MLP
+
+La anchura y profundidad del MLP determinan si actúa como baseline simple o como modelo
+con muchos más parámetros que la TCN. Deben declararse junto con el número total de
+parámetros; “MLP frente a TCN” no es una comparación interpretable si una arquitectura
+tiene mucha más capacidad.
+
+---
+
+## 5. Entrenar conjuntamente o congelar
+
+El estado del encoder durante RL es una decisión experimental independiente de su
+arquitectura.
+
+| Estrategia | Ventaja potencial | Riesgo | Brazo de referencia |
+|---|---|---|---|
+| **Finetuning conjunto** | La representación se adapta a la recompensa | Señal RL ruidosa, representación inestable y mayor varianza | B |
+| **Preentrenado y congelado en IS** | Separa aprendizaje de representación y política | Puede conservar objetivos auxiliares irrelevantes para trading | C |
+| **Preentrenado offline y congelado** | Facilita transferencia y reutilización | Desajuste de dominio entre corpus y activo objetivo | D |
+
+Congelar reduce grados de libertad durante RL, pero no garantiza robustez. Un encoder fijo
+puede imponer una representación inadecuada que la política no puede corregir. Del mismo
+modo, que B aprenda encoder y política conjuntamente no implica que su latente sea
+interpretable o estable.
+
+Para aislar el efecto de congelar, sería necesaria una ablación adicional con el mismo
+encoder preentrenado evaluado una vez congelado y otra con finetuning. Los brazos actuales
+no aíslan completamente esa variable.
+
+---
+
+## 6. Diseño de una comparación arquitectónica justa
+
+Al comparar MLP, TCN y GRU deben mantenerse constantes:
+
+- activos, fechas, split temporal y normalización;
+- variables y orden de entrada;
+- ventana y dimensión latente;
+- corpus y objetivo de preentrenamiento;
+- semillas offline y semillas RL;
+- cabeza Q, exploración, presupuesto y selección de checkpoint;
+- estado congelado o finetuneado del encoder.
+
+También se deben reportar:
+
+- número de parámetros y tiempo de entrenamiento;
+- pérdida de validación de reconstrucción y forecasting;
+- Sharpe, drawdown, retorno, dispersión y gap IS/OOS downstream;
+- resultado por ticker, no solo media agregada.
+
+Una arquitectura puede ser preferible por estabilidad o coste aunque su media de Sharpe
+sea ligeramente inferior. La decisión debe reflejar el objetivo del experimento y no una
+única métrica.
+
+### Matriz mínima recomendada
+
+| Factor | Valores |
 |---|---|
-| `encoder_state_dict` | Pesos del encoder **sin** cabezas auxiliares (p. ej. sin la cabeza de forecasting del pretrainer). |
-| `arch_config` | `encoder_type` + kwargs de arquitectura + `L`, `F`, `feature_names`. Permite reconstruir el encoder con `build_encoder`. |
-| `norm_stats` | `mean`/`std` por feature del corpus de entrenamiento + `feature_names`. |
-| `provenance` | Metadatos: universo, eval_tickers, excluidos, fechas, semilla, nº ventanas, `best_val_loss`, `trained_at`, `git_commit`. |
+| Arquitectura | MLP, TCN, GRU |
+| Dimensión latente | 16, 32, 64 |
+| Estado durante RL | Congelado, finetuning |
+| Objetivo auxiliar | Reconstrucción; reconstrucción + forecasting |
+| Semillas offline | Al menos 3 |
+| Semillas RL | Las mismas 5 por condición |
 
-- `save_encoder_artifact(encoder, norm_stats, provenance, path)`: serializa las cuatro
-  piezas.
-- `load_encoder_artifact(path, cfg=None)`: reconstruye el encoder desde `arch_config`
-  vía `build_encoder`, carga los pesos y devuelve `(encoder, norm_stats, provenance)`.
-  Si se pasa `cfg`, **valida compatibilidad** (`_validate_artifact_compat`): que `L`,
-  `F` y `feature_names` del artefacto coincidan con `cfg.lookback_window`,
-  `len(cfg.features)` y `cfg.features`. Si no coinciden, lanza `ValueError` detallado
-  (fallo ruidoso, no silencioso).
+No es necesario ejecutar el producto cartesiano completo desde el principio. Un diseño
+por etapas puede fijar `latent_dim=32`, comparar arquitecturas, y después estudiar
+capacidad solo en las alternativas prometedoras. Las etapas y criterios de descarte deben
+definirse antes de observar OOS.
 
-Esta validación es la red de seguridad que evita usar por error un encoder entrenado con
-otra ventana/feature-set en un experimento incompatible.
+---
 
-## Integración aguas abajo
+## 7. Artefacto como contrato experimental
 
-- **`LatentDQNAgent`** construye su encoder por factory a partir de `encoder_type` y
-  kwargs, y expone `load_artifact_encoder(path, cfg)` para inyectar un artefacto v2 ya
-  entrenado (brazo D). También admite `precomputed_latents=True` (sin encoder interno).
-- **`EncoderPretrainer` / `pretrain_offline`** entrenan cualquiera de las tres
-  arquitecturas y exportan solo el encoder (sin la cabeza de forecasting) como artefacto.
-- **`ExperimentConfig.encoder_kwargs()`** traduce la config del experimento a los kwargs
-  que espera la factory según `encoder_type`.
+Un encoder preentrenado no queda identificado únicamente por sus pesos. Para reproducir e
+interpretar una comparación deben conservarse:
 
-## Notas de diseño
+- arquitectura y capacidad;
+- ventana, número de variables y orden exacto de features;
+- estadísticas de normalización;
+- corpus, exclusiones y fechas;
+- objetivo auxiliar y parámetros de entrenamiento;
+- semilla y criterio de selección del checkpoint.
 
-- La forma de salida del decoder se homogeneizó a `(N, L, F)` en las tres arquitecturas
-  (el MLP la respeta cuando recibe `input_len`/`n_features`), de modo que las pérdidas de
-  reconstrucción aplanan de forma consistente.
-- La cabeza de forecasting **nunca** se guarda en el artefacto: vive solo en el
-  `EncoderPretrainer`. El artefacto contiene exclusivamente el encoder reutilizable.
-- `arch_config` es la fuente de verdad de la arquitectura: cambiar la arquitectura sin
-  regenerar el artefacto se detecta al cargar (mismatch de pesos o de `L`/`F`).
+Antes de reutilizar un encoder debe comprobarse que ventana, variables y orden coinciden,
+y debe declararse la política de normalización. Una coincidencia de dimensiones no es
+suficiente: dos conjuntos distintos de ocho variables producirían tensores con la misma
+forma y significado incompatible. La campaña actual normaliza cada activo objetivo con
+su `IS_train`; aplicar las estadísticas del corpus offline sería una condición
+experimental distinta, no un detalle intercambiable.
+
+Cambiar la cabeza Q no obliga a regenerar el encoder. Cambiar entrada, arquitectura,
+corpus, objetivo o normalización sí define una representación experimental nueva y debe
+producir un artefacto nuevo con trazabilidad independiente.
+
+---
+
+## 8. Criterios de decisión y límites
+
+La TCN se mantiene como elección principal cuando:
+
+- cubre toda la ventana de forma causal;
+- mejora o mantiene métricas OOS frente a MLP/GRU;
+- no aumenta de forma material la dispersión entre semillas;
+- su coste adicional es aceptable;
+- el resultado no depende de un único ticker.
+
+Debe reconsiderarse cuando una alternativa más simple iguala su rendimiento, cuando la
+ventaja desaparece al igualar capacidad o cuando el resultado se concentra en el objetivo
+de reconstrucción pero no llega a la política RL.
+
+Limitaciones actuales:
+
+- la elección TCN no procede de un sweep arquitectónico exhaustivo;
+- el encoder offline de referencia usa una sola semilla de preentrenamiento;
+- `latent_dim=32` y `channels=64` son decisiones razonadas, no óptimos demostrados;
+- C y D difieren en corpus y escala de preentrenamiento, por lo que su comparación no
+  identifica un único efecto;
+- una representación transferible entre activos con fechas solapadas no equivale a una
+  validación temporal de despliegue.
+
+Para las decisiones de corpus y objetivo multitarea, consultar
+`OFFLINE_PRETRAINING.md`. Para el protocolo de comparación y las métricas, consultar
+`TRAINING_EVAL_PROTOCOL.md`.
