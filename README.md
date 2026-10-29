@@ -1,6 +1,18 @@
-# Latent RL
+# latent-rl
 
 Plataforma experimental para Reinforcement Learning financiero con representaciones latentes.
+
+> **Sobre este repositorio.** Es el historial de desarrollo del software de nuestro Trabajo
+> Fin de Máster *«Plataforma experimental para agentes financieros basados en
+> representaciones latentes y Aprendizaje por Refuerzo»* (Máster Universitario en
+> Inteligencia Artificial, UNIR), realizado por Carlos Cañas García-Moreno, Lucas Fuentes
+> Galán y Manuel Díaz Bermúdez bajo la dirección de Javier Cubo Villalba.
+>
+> La versión entregada con la memoria, con la campaña de resultados de referencia y el
+> encoder preentrenado incluidos, está en
+> **[madibe/latent-rl](https://github.com/madibe/latent-rl)**. Esta copia conserva el
+> historial de commits del proyecto y es donde sigo trabajando por mi cuenta, así que
+> puede ir separándose de la versión entregada.
 
 ## Descripción
 
@@ -31,7 +43,7 @@ Un IVL positivo indica que el agente latente supera al agente directo.
 ### 1. Clonar el repositorio
 
 ```powershell
-git clone https://github.com/tfmia/latent-rl.git
+git clone https://github.com/lsfg01/latent-rl.git
 cd latent-rl
 ```
 

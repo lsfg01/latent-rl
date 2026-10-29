@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "TFM Author", email = "author@example.com"}
+    {name = "Carlos Cañas García-Moreno"},
+    {name = "Lucas Fuentes Galán"},
+    {name = "Manuel Díaz Bermúdez"},
 ]
 
 dependencies = [
